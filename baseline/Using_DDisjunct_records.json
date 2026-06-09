@@ -1,0 +1,260 @@
+{
+  "MadridAdj.txt|k=1": {
+    "dataset": "MadridAdj.txt",
+    "k": 1,
+    "sensor_size": 37,
+    "elapsed": 2.9366211891174316
+  },
+  "MadridAdj.txt|k=2": {
+    "dataset": "MadridAdj.txt",
+    "k": 2,
+    "sensor_size": 48,
+    "elapsed": 1.836832046508789
+  },
+  "MadridAdj.txt|k=3": {
+    "dataset": "MadridAdj.txt",
+    "k": 3,
+    "sensor_size": 51,
+    "elapsed": 1.0005290508270264
+  },
+  "MadridAdj.txt|k=4": {
+    "dataset": "MadridAdj.txt",
+    "k": 4,
+    "sensor_size": 53,
+    "elapsed": 0.9695310592651367
+  },
+  "MadridAdj.txt|k=6": {
+    "dataset": "MadridAdj.txt",
+    "k": 6,
+    "sensor_size": 54,
+    "elapsed": 0.19713783264160156
+  },
+  "MadridAdj.txt|k=8": {
+    "dataset": "MadridAdj.txt",
+    "k": 8,
+    "sensor_size": 54,
+    "elapsed": 0.11874198913574219
+  },
+  "MadridAdj.txt|k=10": {
+    "dataset": "MadridAdj.txt",
+    "k": 10,
+    "sensor_size": 54,
+    "elapsed": 0.06432700157165527
+  },
+  "MadridAdj.txt|k=12": {
+    "dataset": "MadridAdj.txt",
+    "k": 12,
+    "sensor_size": 54,
+    "elapsed": 0.02707219123840332
+  },
+  "MadridAdj.txt|k=16": {
+    "dataset": "MadridAdj.txt",
+    "k": 16,
+    "sensor_size": 54,
+    "elapsed": 0.01979517936706543
+  },
+  "ParisAdj.txt|k=1": {
+    "dataset": "ParisAdj.txt",
+    "k": 1,
+    "sensor_size": 7,
+    "elapsed": 0.41355419158935547
+  },
+  "ParisAdj.txt|k=2": {
+    "dataset": "ParisAdj.txt",
+    "k": 2,
+    "sensor_size": 9,
+    "elapsed": 0.16974592208862305
+  },
+  "ParisAdj.txt|k=3": {
+    "dataset": "ParisAdj.txt",
+    "k": 3,
+    "sensor_size": 9,
+    "elapsed": 0.1970348358154297
+  },
+  "ParisAdj.txt|k=4": {
+    "dataset": "ParisAdj.txt",
+    "k": 4,
+    "sensor_size": 10,
+    "elapsed": 0.001065969467163086
+  },
+  "ParisAdj.txt|k=6": {
+    "dataset": "ParisAdj.txt",
+    "k": 6,
+    "sensor_size": 10,
+    "elapsed": 0.0005619525909423828
+  },
+  "ParisAdj.txt|k=8": {
+    "dataset": "ParisAdj.txt",
+    "k": 8,
+    "sensor_size": 10,
+    "elapsed": 0.0003509521484375
+  },
+  "ParisAdj.txt|k=10": {
+    "dataset": "ParisAdj.txt",
+    "k": 10,
+    "sensor_size": 10,
+    "elapsed": 8.797645568847656e-05
+  },
+  "ParisAdj.txt|k=12": {
+    "dataset": "ParisAdj.txt",
+    "k": 12,
+    "sensor_size": 10,
+    "elapsed": 8.511543273925781e-05
+  },
+  "ParisAdj.txt|k=16": {
+    "dataset": "ParisAdj.txt",
+    "k": 16,
+    "sensor_size": 10,
+    "elapsed": 8.0108642578125e-05
+  },
+  "PhilippineAdj.txt|k=1": {
+    "dataset": "PhilippineAdj.txt",
+    "k": 1,
+    "sensor_size": 12,
+    "elapsed": 0.2806859016418457
+  },
+  "PhilippineAdj.txt|k=2": {
+    "dataset": "PhilippineAdj.txt",
+    "k": 2,
+    "sensor_size": 14,
+    "elapsed": 0.012349128723144531
+  },
+  "PhilippineAdj.txt|k=3": {
+    "dataset": "PhilippineAdj.txt",
+    "k": 3,
+    "sensor_size": 14,
+    "elapsed": 0.002294778823852539
+  },
+  "PhilippineAdj.txt|k=4": {
+    "dataset": "PhilippineAdj.txt",
+    "k": 4,
+    "sensor_size": 14,
+    "elapsed": 0.0012428760528564453
+  },
+  "PhilippineAdj.txt|k=6": {
+    "dataset": "PhilippineAdj.txt",
+    "k": 6,
+    "sensor_size": 14,
+    "elapsed": 0.0010809898376464844
+  },
+  "PhilippineAdj.txt|k=8": {
+    "dataset": "PhilippineAdj.txt",
+    "k": 8,
+    "sensor_size": 14,
+    "elapsed": 0.0007910728454589844
+  },
+  "PhilippineAdj.txt|k=10": {
+    "dataset": "PhilippineAdj.txt",
+    "k": 10,
+    "sensor_size": 14,
+    "elapsed": 0.0006787776947021484
+  },
+  "PhilippineAdj.txt|k=12": {
+    "dataset": "PhilippineAdj.txt",
+    "k": 12,
+    "sensor_size": 14,
+    "elapsed": 0.0006787776947021484
+  },
+  "PhilippineAdj.txt|k=16": {
+    "dataset": "PhilippineAdj.txt",
+    "k": 16,
+    "sensor_size": 14,
+    "elapsed": 0.00012803077697753906
+  },
+  "ZerkaniAdj.txt|k=1": {
+    "dataset": "ZerkaniAdj.txt",
+    "k": 1,
+    "sensor_size": 28,
+    "elapsed": 1.6329870223999023
+  },
+  "ZerkaniAdj.txt|k=2": {
+    "dataset": "ZerkaniAdj.txt",
+    "k": 2,
+    "sensor_size": 35,
+    "elapsed": 1.2453081607818604
+  },
+  "ZerkaniAdj.txt|k=3": {
+    "dataset": "ZerkaniAdj.txt",
+    "k": 3,
+    "sensor_size": 36,
+    "elapsed": 0.98736572265625
+  },
+  "ZerkaniAdj.txt|k=4": {
+    "dataset": "ZerkaniAdj.txt",
+    "k": 4,
+    "sensor_size": 36,
+    "elapsed": 0.7529780864715576
+  },
+  "ZerkaniAdj.txt|k=6": {
+    "dataset": "ZerkaniAdj.txt",
+    "k": 6,
+    "sensor_size": 38,
+    "elapsed": 0.7997100353240967
+  },
+  "ZerkaniAdj.txt|k=8": {
+    "dataset": "ZerkaniAdj.txt",
+    "k": 8,
+    "sensor_size": 39,
+    "elapsed": 0.18228387832641602
+  },
+  "ZerkaniAdj.txt|k=10": {
+    "dataset": "ZerkaniAdj.txt",
+    "k": 10,
+    "sensor_size": 39,
+    "elapsed": 0.04269003868103027
+  },
+  "ZerkaniAdj.txt|k=12": {
+    "dataset": "ZerkaniAdj.txt",
+    "k": 12,
+    "sensor_size": 39,
+    "elapsed": 0.03068399429321289
+  },
+  "ZerkaniAdj.txt|k=16": {
+    "dataset": "ZerkaniAdj.txt",
+    "k": 16,
+    "sensor_size": 39,
+    "elapsed": 0.00935816764831543
+  },
+  "ca-Erdos992.mtx|k=1": {
+    "dataset": "ca-Erdos992.mtx",
+    "k": 1,
+    "sensor_size": 4812,
+    "elapsed": 2059.3095688819885
+  },
+  "ca-Erdos992.mtx|k=2": {
+    "dataset": "ca-Erdos992.mtx",
+    "k": 2,
+    "sensor_size": 4957,
+    "elapsed": 2628.2984340190887
+  },
+  "ca-Erdos992.mtx|k=3": {
+    "dataset": "ca-Erdos992.mtx",
+    "k": 3,
+    "sensor_size": 5023,
+    "elapsed": 3040.7337968349457
+  },
+  "ca-GrQc.mtx|k=1": {
+    "dataset": "ca-GrQc.mtx",
+    "k": 1,
+    "sensor_size": 3568,
+    "elapsed": 1517.328754901886
+  },
+  "ca-GrQc.mtx|k=2": {
+    "dataset": "ca-GrQc.mtx",
+    "k": 2,
+    "sensor_size": 3891,
+    "elapsed": 1785.964359998703
+  },
+  "ca-GrQc.mtx|k=3": {
+    "dataset": "ca-GrQc.mtx",
+    "k": 3,
+    "sensor_size": 3989,
+    "elapsed": 2878.5875878334045
+  },
+  "ca-GrQc.mtx|k=4": {
+    "dataset": "ca-GrQc.mtx",
+    "k": 4,
+    "sensor_size": 4030,
+    "elapsed": 2299.7073101997375
+  }
+}
