@@ -40,7 +40,7 @@ def _discover_graphs() -> list[tuple[str, str]]:
     """Return (stem_name, filename) for every graph file in DATASETS_DIR."""
     result = []
     for path in sorted(DATASETS_DIR.iterdir()):
-        if path.suffix in (".txt", ".mtx") and "report" not in path.name:
+        if path.suffix in (".txt", ".mtx", ".edges") and "report" not in path.name:
             result.append((path.stem, path.name))
     return result
 
