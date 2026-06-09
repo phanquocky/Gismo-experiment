@@ -14,6 +14,8 @@ graph, the 9 (d,l) pairs are solved sequentially.
 from __future__ import annotations
 
 import fcntl
+import os
+import shutil
 import signal
 import sys
 import time
@@ -31,6 +33,10 @@ RESULT_FILE  = _HERE / "Using_DDDisjunct_result.txt"
 
 TIMEOUT_SEC = 2 * 24 * 3600   # 2 days per (d,l) pair
 MAX_WORKERS = 10
+
+_cplex_bin = shutil.which("cplex")
+if _cplex_bin:
+    os.environ["CPLEX_PATH"] = _cplex_bin
 
 _D_VALUES = [1, 2, 3, 4, 6, 8, 10, 12, 16]
 DL_PAIRS  = [(d, d) for d in _D_VALUES]
@@ -132,7 +138,7 @@ def _run_graph(graph_name: str, graph_file: str, done: set) -> list[str]:
             elapsed = time.time() - t0
             _append_result(graph_name, d, l, n, -1, elapsed, "TIMEOUT")
             msgs.append(f"[{graph_name}] d={d:2d} l={l:2d} -> TIMEOUT after {elapsed:.1f}s")
-        except Exception as exc:
+        except (Exception, SystemExit) as exc:
             signal.alarm(0)
             elapsed = time.time() - t0
             msg = str(exc)[:60].replace("|", ";")

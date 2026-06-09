@@ -106,7 +106,12 @@ def ilp_dl_disjunct(
 
     print(f"  Nodes: {n}  |  d: {d}  |  l: {l}  |  Constraints added: {n_constraints}")
 
-    prob.solve(pulp.CPLEX_CMD(msg=0))
+    import os
+    _cplex_path = os.environ.get("CPLEX_PATH")
+    if _cplex_path:
+        prob.solve(pulp.CPLEX_CMD(msg=0, path=_cplex_path))
+    else:
+        prob.solve(pulp.PULP_CBC_CMD(msg=0))
 
     elapsed = time.time() - t0
     obj = pulp.value(prob.objective)
