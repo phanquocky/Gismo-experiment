@@ -19,6 +19,7 @@ import shutil
 import signal
 import sys
 import time
+import resource
 from concurrent.futures import ProcessPoolExecutor, as_completed
 from pathlib import Path
 
@@ -31,12 +32,16 @@ from network_to_matrix import network_to_matrix  # noqa: E402
 DATASETS_DIR = _HERE.parent / "datasets"
 RESULT_FILE  = _HERE / "Using_DDDisjunct_result.txt"
 
-TIMEOUT_SEC = 2 * 24 * 3600   # 2 days per (d,l) pair
-MAX_WORKERS = 10
+TIMEOUT_SEC              = 2 * 24 * 3600   # 2 days per (d,l) pair
+MAX_WORKERS              = 2
+RAM_LIMIT_PER_WORKER_GB  = 35              # abort a solve if the worker process exceeds this
 
 _cplex_bin = shutil.which("cplex")
 if _cplex_bin:
     os.environ["CPLEX_PATH"] = _cplex_bin
+    print(f"Solver        : CPLEX  ({_cplex_bin})")
+else:
+    print("Solver        : CBC  (cplex not found on PATH)")
 
 _D_VALUES = [1, 2, 3, 4, 6, 8, 10, 12, 16]
 DL_PAIRS  = [(d, d) for d in _D_VALUES]
@@ -106,6 +111,13 @@ def _run_graph(graph_name: str, graph_file: str, done: set) -> list[str]:
     """
     from dldisjunct import ilp_dl_disjunct  # imported inside worker for spawn safety
 
+    # Enforce RAM limit for this worker process
+    _limit = int(RAM_LIMIT_PER_WORKER_GB * 1024 ** 3)
+    try:
+        resource.setrlimit(resource.RLIMIT_AS, (_limit, _limit))
+    except Exception:
+        pass
+
     graph_path = str(DATASETS_DIR / graph_file)
     nodes, _ = network_to_matrix(graph_path)
     n = len(nodes)
@@ -138,6 +150,11 @@ def _run_graph(graph_name: str, graph_file: str, done: set) -> list[str]:
             elapsed = time.time() - t0
             _append_result(graph_name, d, l, n, -1, elapsed, "TIMEOUT")
             msgs.append(f"[{graph_name}] d={d:2d} l={l:2d} -> TIMEOUT after {elapsed:.1f}s")
+        except MemoryError:
+            signal.alarm(0)
+            elapsed = time.time() - t0
+            _append_result(graph_name, d, l, n, -1, elapsed, "TOO_LARGE")
+            msgs.append(f"[{graph_name}] d={d:2d} l={l:2d} -> TOO_LARGE (exceeded {RAM_LIMIT_PER_WORKER_GB} GB RAM)")
         except (Exception, SystemExit) as exc:
             signal.alarm(0)
             elapsed = time.time() - t0
