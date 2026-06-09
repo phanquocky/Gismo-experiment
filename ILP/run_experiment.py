@@ -30,7 +30,7 @@ DATASETS_DIR = _HERE.parent / "datasets"
 RESULT_FILE  = _HERE / "Using_DDDisjunct_result.txt"
 
 TIMEOUT_SEC = 2 * 24 * 3600   # 2 days per (d,l) pair
-MAX_WORKERS = 50
+MAX_WORKERS = 10
 
 _D_VALUES = [1, 2, 3, 4, 6, 8, 10, 12, 16]
 DL_PAIRS  = [(d, d) for d in _D_VALUES]
