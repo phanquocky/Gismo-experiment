@@ -106,7 +106,7 @@ def ilp_dl_disjunct(
 
     print(f"  Nodes: {n}  |  d: {d}  |  l: {l}  |  Constraints added: {n_constraints}")
 
-    prob.solve(pulp.PULP_CBC_CMD(msg=0))
+    prob.solve(pulp.CPLEX_CMD(msg=0))
 
     elapsed = time.time() - t0
     obj = pulp.value(prob.objective)

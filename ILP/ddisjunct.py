@@ -81,7 +81,7 @@ def ilp_d_disjunct(network_file: str, d: int) -> Tuple[List[int], float]:
 
     print(f"  Nodes: {n}  |  d: {d}  |  Constraints added: {n_constraints}")
 
-    prob.solve(pulp.PULP_CBC_CMD(msg=0))
+    prob.solve(pulp.CPLEX_CMD(msg=0))
 
     elapsed = time.time() - t0
     obj = pulp.value(prob.objective)
