@@ -2,14 +2,16 @@
 Run (d,l)-disjunct ILP experiments — first half of graphs (sorted alphabetically).
 Results saved to Using_DDDisjunct_result1.txt.
 Run alongside run_experiment2.py in a separate terminal for parallel coverage.
+
+Each ILP solve runs in a dedicated subprocess so the main process is never
+affected by memory limits or solver crashes.
 """
 
 from __future__ import annotations
 
+import multiprocessing
 import os
-import resource
 import shutil
-import signal
 import sys
 import time
 from pathlib import Path
@@ -24,7 +26,7 @@ DATASETS_DIR = _HERE.parent / "datasets"
 RESULT_FILE  = _HERE / "Using_DDDisjunct_result1.txt"
 
 TIMEOUT_SEC             = 2 * 24 * 3600
-RAM_LIMIT_PER_WORKER_GB = 35
+RAM_LIMIT_PER_WORKER_GB = 30
 
 _cplex_bin = shutil.which("cplex")
 if _cplex_bin:
@@ -43,16 +45,6 @@ def _discover_graphs() -> list[tuple[str, str]]:
         if path.suffix in (".txt", ".mtx", ".edges") and "report" not in path.name:
             result.append((path.stem, path.name))
     return result
-
-
-# ── Timeout helper ────────────────────────────────────────────────────────────
-
-class _Timeout(Exception):
-    pass
-
-
-def _alarm_handler(signum, frame):
-    raise _Timeout()
 
 
 # ── Result file helpers ───────────────────────────────────────────────────────
@@ -85,11 +77,59 @@ def _append_result(graph_name: str, d: int, l: int, n: int,
         f.write(line)
 
 
+# ── Solve subprocess ──────────────────────────────────────────────────────────
+
+def _solve_worker(graph_path: str, d: int, l: int, out_queue: multiprocessing.Queue) -> None:
+    """
+    Runs inside a fresh subprocess for each solve.
+    Sets RAM limit here so the main process is never constrained.
+    Puts (status, size, elapsed, sensor_nodes) into out_queue.
+    """
+    import resource
+    _limit = int(RAM_LIMIT_PER_WORKER_GB * 1024 ** 3)
+    try:
+        resource.setrlimit(resource.RLIMIT_AS, (_limit, _limit))
+    except Exception:
+        pass
+
+    from dldisjunct import ilp_dl_disjunct
+    try:
+        sensor_nodes, obj, elapsed = ilp_dl_disjunct(graph_path, d, l)
+        out_queue.put(("OK", int(obj) if obj is not None else -1, elapsed, sensor_nodes))
+    except MemoryError:
+        out_queue.put(("TOO_LARGE", -1, 0.0, []))
+    except (Exception, SystemExit) as exc:
+        out_queue.put(("ERROR", -1, 0.0, str(exc)[:60]))
+
+
+def _run_solve(graph_path: str, d: int, l: int) -> tuple:
+    """
+    Spawn a subprocess for one ILP solve.
+    Returns (status, size, elapsed, sensor_nodes).
+    Timeout and OOM are handled without affecting the main process.
+    """
+    out_queue: multiprocessing.Queue = multiprocessing.Queue()
+    proc = multiprocessing.Process(target=_solve_worker, args=(graph_path, d, l, out_queue))
+    t0 = time.time()
+    proc.start()
+    proc.join(timeout=TIMEOUT_SEC)
+    elapsed = time.time() - t0
+
+    if proc.is_alive():
+        proc.kill()
+        proc.join()
+        return "TIMEOUT", -1, elapsed, []
+
+    try:
+        return out_queue.get(timeout=10)
+    except Exception:
+        # Process exited without writing a result — killed by OOM or crashed
+        return "TOO_LARGE", -1, elapsed, []
+
+
 # ── Per-graph runner ──────────────────────────────────────────────────────────
 
 def _run_graph(graph_name: str, graph_file: str, done: set) -> None:
-    from dldisjunct import ilp_dl_disjunct
-
     graph_path = str(DATASETS_DIR / graph_file)
     nodes, _ = network_to_matrix(graph_path)
     n = len(nodes)
@@ -106,30 +146,18 @@ def _run_graph(graph_name: str, graph_file: str, done: set) -> None:
             print(f"[{graph_name}] d={d:2d} l={l:2d} -> TRIVIAL (d+l={d+l} > n={n})")
             continue
 
-        signal.signal(signal.SIGALRM, _alarm_handler)
-        signal.alarm(TIMEOUT_SEC)
-        t0 = time.time()
-        try:
-            sensor_nodes, obj, elapsed = ilp_dl_disjunct(graph_path, d, l)
-            signal.alarm(0)
-            size = int(obj) if obj is not None else -1
-            _append_result(graph_name, d, l, n, size, elapsed, "OK", sensor_nodes)
+        status, size, elapsed, sensor_nodes = _run_solve(graph_path, d, l)
+        _append_result(graph_name, d, l, n, size, elapsed, status,
+                       sensor_nodes if status == "OK" else None)
+
+        if status == "OK":
             print(f"[{graph_name}] d={d:2d} l={l:2d} -> OK  size={size}  time={elapsed:.1f}s")
-        except _Timeout:
-            elapsed = time.time() - t0
-            _append_result(graph_name, d, l, n, -1, elapsed, "TIMEOUT")
+        elif status == "TIMEOUT":
             print(f"[{graph_name}] d={d:2d} l={l:2d} -> TIMEOUT after {elapsed:.1f}s")
-        except MemoryError:
-            signal.alarm(0)
-            elapsed = time.time() - t0
-            _append_result(graph_name, d, l, n, -1, elapsed, "TOO_LARGE")
+        elif status == "TOO_LARGE":
             print(f"[{graph_name}] d={d:2d} l={l:2d} -> TOO_LARGE (exceeded {RAM_LIMIT_PER_WORKER_GB} GB RAM)")
-        except (Exception, SystemExit) as exc:
-            signal.alarm(0)
-            elapsed = time.time() - t0
-            msg = str(exc)[:60].replace("|", ";")
-            _append_result(graph_name, d, l, n, -1, elapsed, f"ERROR_{msg}")
-            print(f"[{graph_name}] d={d:2d} l={l:2d} -> ERROR: {msg}")
+        else:
+            print(f"[{graph_name}] d={d:2d} l={l:2d} -> {status}  {sensor_nodes[:60]}")
 
 
 # ── Core experiment loop ──────────────────────────────────────────────────────
@@ -237,12 +265,6 @@ def write_report() -> None:
 # ── Entry point ───────────────────────────────────────────────────────────────
 
 def main() -> None:
-    _limit = int(RAM_LIMIT_PER_WORKER_GB * 1024 ** 3)
-    try:
-        resource.setrlimit(resource.RLIMIT_AS, (_limit, _limit))
-    except Exception:
-        pass
-
     run_experiments()
     write_report()
 
