@@ -14,6 +14,7 @@ import os
 import shutil
 import sys
 import time
+from math import comb
 from pathlib import Path
 
 _HERE = Path(__file__).parent
@@ -77,13 +78,22 @@ def _append_result(graph_name: str, d: int, l: int, n: int,
         f.write(line)
 
 
+# ── Constraint count filter (remove when no longer needed) ───────────────────
+
+CONSTRAINT_LIMIT = 30_000_000
+
+def _constraint_count_exceeds_limit(n: int, d: int, l: int) -> bool:
+    return comb(n, d + l) * comb(d + l, l) > CONSTRAINT_LIMIT
+
+
 # ── Solve subprocess ──────────────────────────────────────────────────────────
 
-def _solve_worker(graph_path: str, d: int, l: int, out_queue: multiprocessing.Queue) -> None:
+def _solve_worker(graph_path: str, d: int, l: int, conn) -> None:
     """
     Runs inside a fresh subprocess for each solve.
     Sets RAM limit here so the main process is never constrained.
-    Puts (status, size, elapsed, sensor_nodes) into out_queue.
+    Sends (status, size, elapsed, sensor_nodes) via pipe — no thread spawned,
+    so this works even when virtual memory is nearly exhausted.
     """
     import resource
     _limit = int(RAM_LIMIT_PER_WORKER_GB * 1024 ** 3)
@@ -95,11 +105,13 @@ def _solve_worker(graph_path: str, d: int, l: int, out_queue: multiprocessing.Qu
     from dldisjunct import ilp_dl_disjunct
     try:
         sensor_nodes, obj, elapsed = ilp_dl_disjunct(graph_path, d, l)
-        out_queue.put(("OK", int(obj) if obj is not None else -1, elapsed, sensor_nodes))
+        conn.send(("OK", int(obj) if obj is not None else -1, elapsed, sensor_nodes))
     except MemoryError:
-        out_queue.put(("TOO_LARGE", -1, 0.0, []))
+        conn.send(("TOO_LARGE", -1, 0.0, []))
     except (Exception, SystemExit) as exc:
-        out_queue.put(("ERROR", -1, 0.0, str(exc)[:60]))
+        conn.send(("ERROR", -1, 0.0, str(exc)[:60]))
+    finally:
+        conn.close()
 
 
 def _run_solve(graph_path: str, d: int, l: int) -> tuple:
@@ -108,23 +120,30 @@ def _run_solve(graph_path: str, d: int, l: int) -> tuple:
     Returns (status, size, elapsed, sensor_nodes).
     Timeout and OOM are handled without affecting the main process.
     """
-    out_queue: multiprocessing.Queue = multiprocessing.Queue()
-    proc = multiprocessing.Process(target=_solve_worker, args=(graph_path, d, l, out_queue))
+    parent_conn, child_conn = multiprocessing.Pipe(duplex=False)
+    proc = multiprocessing.Process(target=_solve_worker, args=(graph_path, d, l, child_conn))
     t0 = time.time()
     proc.start()
+    child_conn.close()  # only used in child
     proc.join(timeout=TIMEOUT_SEC)
     elapsed = time.time() - t0
 
     if proc.is_alive():
         proc.kill()
         proc.join()
+        parent_conn.close()
         return "TIMEOUT", -1, elapsed, []
 
     try:
-        return out_queue.get(timeout=10)
+        if parent_conn.poll(timeout=10):
+            return parent_conn.recv()
     except Exception:
-        # Process exited without writing a result — killed by OOM or crashed
-        return "TOO_LARGE", -1, elapsed, []
+        pass
+    finally:
+        parent_conn.close()
+
+    # Subprocess exited without sending — killed by OS OOM or unrecoverable crash
+    return "TOO_LARGE", -1, elapsed, []
 
 
 # ── Per-graph runner ──────────────────────────────────────────────────────────
@@ -144,6 +163,11 @@ def _run_graph(graph_name: str, graph_file: str, done: set) -> None:
         if d + l > n:
             _append_result(graph_name, d, l, n, 0, 0.0, "TRIVIAL")
             print(f"[{graph_name}] d={d:2d} l={l:2d} -> TRIVIAL (d+l={d+l} > n={n})")
+            continue
+
+        if _constraint_count_exceeds_limit(n, d, l):
+            _append_result(graph_name, d, l, n, 0, 0.0, "TOO_LARGE")
+            print(f"[{graph_name}] d={d:2d} l={l:2d} -> TOO_LARGE (constraint count > {CONSTRAINT_LIMIT:,})")
             continue
 
         status, size, elapsed, sensor_nodes = _run_solve(graph_path, d, l)
