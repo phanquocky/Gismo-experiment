@@ -271,7 +271,7 @@ def run_experiments() -> None:
     records = _load_records()
 
     dataset_files = sorted(
-        f for f in DATASETS_DIR.iterdir() if f.suffix in (".txt", ".mtx")
+        f for f in DATASETS_DIR.iterdir() if f.suffix in (".txt", ".mtx", ".edges")
     )
 
     tasks = [
