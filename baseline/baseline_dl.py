@@ -4,15 +4,20 @@ Baseline algorithm for sensor placement using (d,l)-disjunctive matrix reduction
 Task 5: Greedy algorithm that removes node pairs (x_i, y_i) from the matrix
         while maintaining (d,l)-disjunctiveness.
 Task 6: Batch experiments across all datasets for the (d,l) pairs defined in
-        DL_PAIRS below.
+        DL_PAIRS below — N_WORKERS parallel subprocesses, each bounded by
+        TIME_LIMIT_SEC and RAM_LIMIT_GB.
 """
 
 from __future__ import annotations
 
 import json
+import multiprocessing
 import random
 import sys
+import threading
 import time
+from concurrent.futures import ThreadPoolExecutor, as_completed
+from itertools import combinations
 from pathlib import Path
 from typing import Dict, List, Optional, Set, Tuple
 
@@ -24,17 +29,23 @@ from network_to_matrix import network_to_matrix  # noqa: E402
 
 # ── Paths ─────────────────────────────────────────────────────────────────────
 
-_BASE = Path(__file__).parent
+_BASE        = Path(__file__).parent
 DATASETS_DIR = _BASE.parent / "datasets"
 RESULTS_FILE = _BASE / "Using_DL_Disjunct_result.txt"
 RECORDS_FILE = _BASE / "Using_DL_Disjunct_records.json"
 REPORT_FILE  = _BASE / "Using_DL_Disjunct_report.txt"
 
+# ── Experiment config ─────────────────────────────────────────────────────────
+
+TIME_LIMIT_SEC = 8 * 3600   # 8 hours per (graph, d, l) task
+RAM_LIMIT_GB   = 32          # GB of virtual memory per worker subprocess
+N_WORKERS      = 3           # parallel subprocess slots
+
 # (d, l) pairs from the spec.
-# Note: (10, 17) in the original spec has l > d (violates l <= d), treated as (10, 7).
 DL_PAIRS: List[Tuple[int, int]] = [
-    (1, 1), (2, 2), (3, 3), (4, 4), (6, 5), (8, 6), (10, 7), (12, 8), (16, 9),
+    (1, 1), (2, 2), (3, 3), (4, 4), (6, 6), (8, 8), (10, 10), (12, 12), (16, 16),
 ]
+
 
 # ── Task 5: greedy sensor placement ──────────────────────────────────────────
 
@@ -42,18 +53,18 @@ def dl_sensor_placement(
     network_file: str,
     d: int,
     l: int,
-    m_trials: int = 10_000,
+    m_trials: int = 100_000,
     seed: Optional[int] = None,
 ) -> Tuple[List[int], float]:
     """
     Greedy baseline for finding a (near-)minimal sensor set.
 
     Speedups vs. the naive version:
-      * NumPy arrays — column extraction and transpose are O(1) views.
-      * Vectorised witness-row check — replaces Python loops in has_witness_row.
-      * Random (S, L) sampling per trial — replaces the O(C(d+l, l)) exhaustive
-        enumeration of L-subsets per trial. Equivalent probabilistic coverage
-        with O(1) work per trial instead of exponential.
+      * NumPy arrays — column extraction.
+      * Vectorised witness-column check — replaces Python loops.
+      * Exhaustive C(d+l, l) enumeration per trial — for each sampled S of size
+        d+l, all L-subsets of size l are checked. This is exact per S: if any
+        partition has no witness column the node is immediately marked essential.
       * Essential-node caching — once essential, a node is never retested (the
         active column set only shrinks, making the property harder to satisfy).
 
@@ -70,7 +81,7 @@ def dl_sensor_placement(
     n = len(nodes)
 
     # Convert once; skip row 0 (all-zeros empty state)
-    mat = np.array(matrix[1:], dtype=np.int8)  # (n, 2n)
+    mat = np.array(matrix[1:], dtype=np.int8)  # (n_scenarios, 2n)
 
     active_cols: Set[int] = set(range(2 * n))
     sensor_indices: Set[int] = set(range(n))
@@ -92,37 +103,38 @@ def dl_sensor_placement(
                 essential_indices.add(node_idx)
                 continue
 
-            # Transposed submatrix: rows = active col pairs, cols = failure scenarios
-            sub = mat[:, test_cols].T  # (|test_cols|, n)
-            n_sub_cols = sub.shape[1]
-            if n_sub_cols < dl:
+            # Submatrix: rows = failure scenarios, cols = active col pairs
+            sub = mat[:, test_cols]  # (n_scenarios, |test_cols|)
+            n_sub_rows = sub.shape[0]
+            if n_sub_rows < dl:
                 essential_indices.add(node_idx)
                 continue
 
-            # Randomised (d,l)-disjunct check (NumPy vectorised).
-            # Each trial picks a random S of size d+l AND a random L of size l
-            # (instead of enumerating all C(d+l,l) partitions per trial).
-            # This reduces per-trial cost from O(C(d+l,l) × t) to O(t), while
-            # still sampling uniformly over all (S, L) counterexample candidates.
+            # Exhaustive (d,l)-disjunct check (NumPy vectorised).
+            # Each trial picks a random S of size d+l from failure scenarios,
+            # then enumerates ALL C(d+l, l) L-subsets of S. A witness column
+            # is one that reads 0 on all D-scenarios and 1 on some L-scenario.
             is_dl = True
             for _ in range(m_trials):
-                S = rng.choice(n_sub_cols, dl, replace=False)
+                S = rng.choice(n_sub_rows, dl, replace=False)
 
-                # Random L of size l drawn from S's local indices [0..dl)
-                L_local = rng.choice(dl, l, replace=False)
-                L_mask = np.zeros(dl, dtype=bool)
-                L_mask[L_local] = True
-                D_mask = ~L_mask
+                for L_local in combinations(range(dl), l):
+                    L_mask = np.zeros(dl, dtype=bool)
+                    L_mask[list(L_local)] = True
+                    D_mask = ~L_mask
 
-                D_sub = sub[:, S[D_mask]]  # (t, d)
-                L_sub = sub[:, S[L_mask]]  # (t, l)
+                    D_sub = sub[S[D_mask], :]  # (d, |test_cols|)
+                    L_sub = sub[S[L_mask], :]  # (l, |test_cols|)
 
-                # Witness row: all D-cols are 0 AND at least one L-col is 1
-                d_ok = np.all(D_sub == 0, axis=1)   # (t,)
-                l_ok = np.any(L_sub == 1, axis=1)   # (t,)
+                    # Witness column: all D-rows are 0 AND at least one L-row is 1
+                    d_ok = np.all(D_sub == 0, axis=0)
+                    l_ok = np.any(L_sub == 1, axis=0)
 
-                if not bool(np.any(d_ok & l_ok)):
-                    is_dl = False
+                    if not bool(np.any(d_ok & l_ok)):
+                        is_dl = False
+                        break
+
+                if not is_dl:
                     break
 
             if is_dl:
@@ -141,7 +153,70 @@ def dl_sensor_placement(
     return sensor_nodes, elapsed
 
 
-# ── Task 6: batch experiments ─────────────────────────────────────────────────
+# ── Subprocess worker ─────────────────────────────────────────────────────────
+
+def _worker_subprocess(graph_path: str, d: int, l: int, conn) -> None:
+    """
+    Runs inside a dedicated subprocess for each (graph, d, l) task.
+    Sets RAM limit via resource.setrlimit, then runs dl_sensor_placement.
+    Sends (status, size, elapsed, sensors) back through the pipe.
+    """
+    import resource
+    limit = int(RAM_LIMIT_GB * 1024 ** 3)
+    try:
+        resource.setrlimit(resource.RLIMIT_AS, (limit, limit))
+    except Exception:
+        pass
+
+    try:
+        sensors, elapsed = dl_sensor_placement(graph_path, d, l)
+        conn.send(("OK", len(sensors), elapsed, sensors))
+    except MemoryError:
+        conn.send(("RAM_LIMIT", -1, 0.0, []))
+    except (Exception, SystemExit) as exc:
+        conn.send(("ERROR", -1, 0.0, str(exc)[:120]))
+    finally:
+        conn.close()
+
+
+def _run_one_task(graph_path: str, d: int, l: int) -> tuple:
+    """
+    Thread-level task runner.
+    Spawns a subprocess, waits up to TIME_LIMIT_SEC, then kills if still alive.
+    Returns (status, size, elapsed, sensors).
+      status: "OK" | "TIME_LIMIT" | "RAM_LIMIT" | "ERROR"
+    """
+    parent_conn, child_conn = multiprocessing.Pipe(duplex=False)
+    proc = multiprocessing.Process(
+        target=_worker_subprocess,
+        args=(graph_path, d, l, child_conn),
+    )
+    t0 = time.time()
+    proc.start()
+    child_conn.close()  # only used in child
+
+    proc.join(timeout=TIME_LIMIT_SEC)
+    elapsed = time.time() - t0
+
+    if proc.is_alive():
+        proc.kill()
+        proc.join()
+        parent_conn.close()
+        return "TIME_LIMIT", -1, elapsed, []
+
+    try:
+        if parent_conn.poll(timeout=10):
+            return parent_conn.recv()
+    except Exception:
+        pass
+    finally:
+        parent_conn.close()
+
+    # Subprocess exited without sending — killed by OS OOM or unrecoverable crash
+    return "RAM_LIMIT", -1, elapsed, []
+
+
+# ── Result helpers ────────────────────────────────────────────────────────────
 
 def _load_records() -> Dict[str, dict]:
     if RECORDS_FILE.exists():
@@ -157,50 +232,157 @@ def _save_record(
     l: int,
     sensor_size: int,
     elapsed: float,
+    status: str,
 ) -> None:
     key = f"{dataset_name}|d={d}|l={l}"
     records[key] = dict(
-        dataset=dataset_name, d=d, l=l, sensor_size=sensor_size, elapsed=elapsed
+        dataset=dataset_name, d=d, l=l,
+        sensor_size=sensor_size, elapsed=elapsed, status=status,
     )
     with open(RECORDS_FILE, "w") as f:
         json.dump(records, f, indent=2)
 
 
 def _append_raw_result(
-    dataset_name: str, d: int, l: int, sensor_size: int, elapsed: float
+    dataset_name: str, d: int, l: int, sensor_size: int, elapsed: float, status: str,
 ) -> None:
+    ts = time.strftime("%Y-%m-%d %H:%M:%S")
     with open(RESULTS_FILE, "a") as f:
         f.write(
             f"{dataset_name}\td={d}\tl={l}\tsensor_size={sensor_size}"
-            f"\telapsed={elapsed:.2f}s\n"
+            f"\telapsed={elapsed:.2f}s\tstatus={status}\tts={ts}\n"
         )
 
 
+# ── Batch experiment runner ───────────────────────────────────────────────────
+
+def run_experiments() -> None:
+    """
+    Task 6: Run dl_sensor_placement on every (dataset, d, l) combination.
+
+    Layout:
+      - N_WORKERS threads each manage one subprocess slot.
+      - Each subprocess is bounded by TIME_LIMIT_SEC and RAM_LIMIT_GB.
+      - Every completed task (OK / TIME_LIMIT / RAM_LIMIT / ERROR) is written
+        to both the JSON checkpoint and the raw results file before the next
+        task starts in that slot — no result is ever lost.
+      - Already-recorded tasks are skipped on resume.
+    """
+    records = _load_records()
+
+    dataset_files = sorted(
+        f for f in DATASETS_DIR.iterdir() if f.suffix in (".txt", ".mtx")
+    )
+
+    tasks = [
+        (ds_path, d, l)
+        for ds_path in dataset_files
+        for d, l in DL_PAIRS
+        if f"{ds_path.name}|d={d}|l={l}" not in records
+    ]
+
+    total = len(tasks)
+    print("=" * 60)
+    print(f"Datasets       : {len(dataset_files)}")
+    print(f"(d,l) pairs    : {len(DL_PAIRS)}  {DL_PAIRS}")
+    print(f"Total tasks    : {total}  ({len(records)} already done, skipped)")
+    print(f"Workers        : {N_WORKERS} parallel subprocesses")
+    print(f"Time limit     : {TIME_LIMIT_SEC // 3600}h per task")
+    print(f"RAM limit      : {RAM_LIMIT_GB} GB per worker")
+    print("=" * 60)
+    print()
+
+    if not tasks:
+        print("Nothing to do — all tasks already recorded.")
+        _write_report(records, [f.name for f in dataset_files])
+        return
+
+    write_lock = threading.Lock()
+    completed = 0
+
+    def handle_task(ds_path: Path, d: int, l: int) -> None:
+        nonlocal completed
+        name = ds_path.name
+        ts_start = time.strftime("%H:%M:%S")
+        print(f"[{ts_start}] START  {name}  d={d} l={l}")
+
+        status, size, elapsed, _ = _run_one_task(str(ds_path), d, l)
+
+        # Write result immediately — under lock so JSON stays consistent
+        with write_lock:
+            _save_record(records, name, d, l, size, elapsed, status)
+            _append_raw_result(name, d, l, size, elapsed, status)
+            completed += 1
+            ts_end = time.strftime("%H:%M:%S")
+            print(
+                f"[{ts_end}] DONE   {name}  d={d} l={l}"
+                f"  -> {status}  size={size}  time={elapsed:.1f}s"
+                f"  [{completed}/{total}]"
+            )
+
+    with ThreadPoolExecutor(max_workers=N_WORKERS) as executor:
+        futures = {
+            executor.submit(handle_task, ds_path, d, l): (ds_path.name, d, l)
+            for ds_path, d, l in tasks
+        }
+        for future in as_completed(futures):
+            try:
+                future.result()
+            except Exception as exc:
+                name, d, l = futures[future]
+                print(f"[UNEXPECTED ERROR] {name} d={d} l={l}: {exc}")
+
+    print()
+    _write_report(records, [f.name for f in dataset_files])
+
+
+# ── Report generator ──────────────────────────────────────────────────────────
+
 def _write_report(records: Dict[str, dict], dataset_names: List[str]) -> None:
-    col_w = 10
+    col_w = 14
     dl_headers = [f"d={d},l={l}" for d, l in DL_PAIRS]
 
     def _row(label: str, values: list) -> str:
-        return f"{label:<45}" + "".join(f"{v:>{col_w}}" for v in values)
+        return f"{label:<45}" + "".join(f"{str(v):>{col_w}}" for v in values)
 
     header = _row("Dataset", dl_headers)
-    sep = "-" * len(header)
+    sep    = "-" * len(header)
 
-    def _section(title: str, field: str, fmt: str) -> List[str]:
+    def _size_cell(rec: Optional[dict]) -> str:
+        if rec is None:
+            return "N/A"
+        s = rec.get("status", "OK")
+        return str(rec["sensor_size"]) if s == "OK" else s
+
+    def _time_cell(rec: Optional[dict]) -> str:
+        if rec is None:
+            return "N/A"
+        return f"{rec['elapsed']:.2f}"
+
+    def _section(title: str, cell_fn) -> List[str]:
         lines = [title, sep, header, sep]
         for name in dataset_names:
-            vals = []
-            for d, l in DL_PAIRS:
-                rec = records.get(f"{name}|d={d}|l={l}")
-                vals.append(f"{rec[field]:{fmt}}" if rec else "N/A")
+            vals = [cell_fn(records.get(f"{name}|d={d}|l={l}")) for d, l in DL_PAIRS]
             lines.append(_row(name, vals))
         return lines
 
     report_lines = (
-        ["Baseline Algorithm – (d,l)-Disjunct Greedy Reduction", "=" * 80, ""]
-        + _section("Sensor Set Size", "sensor_size", "d")
+        [
+            "Baseline Algorithm – (d,l)-Disjunct Greedy Reduction",
+            "=" * 80,
+            f"Generated  : {time.strftime('%Y-%m-%d %H:%M:%S')}",
+            f"Time limit : {TIME_LIMIT_SEC // 3600}h per task",
+            f"RAM limit  : {RAM_LIMIT_GB} GB per worker",
+            f"Workers    : {N_WORKERS}",
+            "=" * 80,
+            "",
+        ]
+        + _section(
+            "Sensor Set Size  (OK → count, otherwise: TIME_LIMIT / RAM_LIMIT / ERROR)",
+            _size_cell,
+        )
         + [""]
-        + _section("Run Time (seconds)", "elapsed", ".2f")
+        + _section("Run Time (seconds)", _time_cell)
         + [""]
     )
 
@@ -208,40 +390,7 @@ def _write_report(records: Dict[str, dict], dataset_names: List[str]) -> None:
     print(f"Report saved → {REPORT_FILE}")
 
 
-def run_experiments() -> None:
-    """Task 6: Run the DL baseline on every dataset for every (d,l) pair."""
-    records = _load_records()
-
-    dataset_files = sorted(
-        f for f in DATASETS_DIR.iterdir() if f.suffix in (".txt", ".mtx")
-    )
-    print(f"Datasets found : {len(dataset_files)}")
-    print(f"(d,l) pairs    : {DL_PAIRS}\n")
-
-    for ds_path in dataset_files:
-        name = ds_path.name
-        for d, l in DL_PAIRS:
-            key = f"{name}|d={d}|l={l}"
-            if key in records:
-                rec = records[key]
-                print(
-                    f"  SKIP  {name}  d={d}  l={l}"
-                    f"  (size={rec['sensor_size']}, {rec['elapsed']:.1f}s)"
-                )
-                continue
-
-            print(f"  RUN   {name}  d={d}  l={l} ...", end="", flush=True)
-            try:
-                sensors, elapsed = dl_sensor_placement(str(ds_path), d, l)
-                size = len(sensors)
-                print(f"  size={size}  time={elapsed:.2f}s")
-                _save_record(records, name, d, l, size, elapsed)
-                _append_raw_result(name, d, l, size, elapsed)
-            except Exception as exc:
-                print(f"  ERROR: {exc}")
-
-    _write_report(records, [f.name for f in dataset_files])
-
+# ── Entry point ───────────────────────────────────────────────────────────────
 
 if __name__ == "__main__":
     run_experiments()
