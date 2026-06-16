@@ -14,7 +14,6 @@ import os
 import shutil
 import sys
 import time
-from math import comb
 from pathlib import Path
 
 _HERE = Path(__file__).parent
@@ -26,8 +25,8 @@ from network_to_matrix import network_to_matrix  # noqa: E402
 DATASETS_DIR = _HERE.parent / "datasets"
 RESULT_FILE  = _HERE / "Using_DDDisjunct_result2.txt"
 
-TIMEOUT_SEC             = 2 * 24 * 3600
-RAM_LIMIT_PER_WORKER_GB = 30
+TIMEOUT_SEC             = 8 * 3600
+RAM_LIMIT_PER_WORKER_GB = 32
 
 _cplex_bin = shutil.which("cplex")
 if _cplex_bin:
@@ -78,14 +77,6 @@ def _append_result(graph_name: str, d: int, l: int, n: int,
         f.write(line)
 
 
-# ── Constraint count filter (remove when no longer needed) ───────────────────
-
-CONSTRAINT_LIMIT = 30_000_000
-
-def _constraint_count_exceeds_limit(n: int, d: int, l: int) -> bool:
-    return comb(n, d + l) * comb(d + l, l) > CONSTRAINT_LIMIT
-
-
 # ── Solve subprocess ──────────────────────────────────────────────────────────
 
 def _solve_worker(graph_path: str, d: int, l: int, conn) -> None:
@@ -107,7 +98,7 @@ def _solve_worker(graph_path: str, d: int, l: int, conn) -> None:
         sensor_nodes, obj, elapsed = ilp_dl_disjunct(graph_path, d, l)
         conn.send(("OK", int(obj) if obj is not None else -1, elapsed, sensor_nodes))
     except MemoryError:
-        conn.send(("TOO_LARGE", -1, 0.0, []))
+        conn.send(("RAM_LIMIT", -1, 0.0, []))
     except (Exception, SystemExit) as exc:
         conn.send(("ERROR", -1, 0.0, str(exc)[:60]))
     finally:
@@ -143,7 +134,7 @@ def _run_solve(graph_path: str, d: int, l: int) -> tuple:
         parent_conn.close()
 
     # Subprocess exited without sending — killed by OS OOM or unrecoverable crash
-    return "TOO_LARGE", -1, elapsed, []
+    return "RAM_LIMIT", -1, elapsed, []
 
 
 # ── Per-graph runner ──────────────────────────────────────────────────────────
@@ -165,21 +156,16 @@ def _run_graph(graph_name: str, graph_file: str, done: set) -> None:
             print(f"[{graph_name}] d={d:2d} l={l:2d} -> TRIVIAL (d+l={d+l} > n={n})")
             continue
 
-        if _constraint_count_exceeds_limit(n, d, l):
-            _append_result(graph_name, d, l, n, 0, 0.0, "TOO_LARGE")
-            print(f"[{graph_name}] d={d:2d} l={l:2d} -> TOO_LARGE (constraint count > {CONSTRAINT_LIMIT:,})")
-            continue
-
         status, size, elapsed, sensor_nodes = _run_solve(graph_path, d, l)
         _append_result(graph_name, d, l, n, size, elapsed, status,
                        sensor_nodes if status == "OK" else None)
 
         if status == "OK":
             print(f"[{graph_name}] d={d:2d} l={l:2d} -> OK  size={size}  time={elapsed:.1f}s")
-        elif status == "TIMEOUT":
-            print(f"[{graph_name}] d={d:2d} l={l:2d} -> TIMEOUT after {elapsed:.1f}s")
-        elif status == "TOO_LARGE":
-            print(f"[{graph_name}] d={d:2d} l={l:2d} -> TOO_LARGE (exceeded {RAM_LIMIT_PER_WORKER_GB} GB RAM)")
+        elif status == "TIME_LIMIT":
+            print(f"[{graph_name}] d={d:2d} l={l:2d} -> TIME_LIMIT after {elapsed:.1f}s (limit={TIMEOUT_SEC // 3600}h)")
+        elif status == "RAM_LIMIT":
+            print(f"[{graph_name}] d={d:2d} l={l:2d} -> RAM_LIMIT (exceeded {RAM_LIMIT_PER_WORKER_GB} GB)")
         else:
             print(f"[{graph_name}] d={d:2d} l={l:2d} -> {status}  {sensor_nodes[:60]}")
 
@@ -267,8 +253,10 @@ def write_report() -> None:
                 lines.append(f"  {dl:<10}  {float(r['elapsed']):>8.3f}  {sensors}")
             elif status == "TRIVIAL":
                 lines.append(f"  {dl:<10}  {'—':>8}  TRIVIAL (d+l > n)")
-            elif status == "TIMEOUT":
-                lines.append(f"  {dl:<10}  {float(r['elapsed']):>8.1f}  TIMEOUT")
+            elif status == "TIME_LIMIT":
+                lines.append(f"  {dl:<10}  {float(r['elapsed']):>8.1f}  TIME_LIMIT")
+            elif status == "RAM_LIMIT":
+                lines.append(f"  {dl:<10}  {float(r['elapsed']):>8.3f}  RAM_LIMIT")
             else:
                 lines.append(f"  {dl:<10}  {float(r['elapsed']):>8.3f}  {status[:50]}")
 
