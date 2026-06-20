@@ -9,6 +9,7 @@ affected by memory limits or solver crashes.
 
 from __future__ import annotations
 
+import math
 import multiprocessing
 import os
 import shutil
@@ -24,9 +25,12 @@ from network_to_matrix import network_to_matrix  # noqa: E402
 
 DATASETS_DIR = _HERE.parent / "datasets"
 RESULT_FILE  = _HERE / "Using_DDDisjunct_result1.txt"
+RESULT_FILE_1 = _HERE / "Using_DDDisjunct_result2.txt"
+
 
 TIMEOUT_SEC             = 8 * 3600
 RAM_LIMIT_PER_WORKER_GB = 32
+CONSTRAINT_LIMIT        = 500_000_000
 
 _cplex_bin = shutil.which("cplex")
 if _cplex_bin:
@@ -61,7 +65,20 @@ def _load_done() -> set:
                     done.add((parts[1], int(parts[2]), int(parts[3])))
                 except ValueError:
                     pass
+
+    if not RESULT_FILE_1.exists():
+        return done
+    for line in RESULT_FILE_1.read_text().splitlines():
+        if line.startswith("DATA|"):
+            parts = line.split("|")
+            if len(parts) >= 4:
+                try:
+                    done.add((parts[1], int(parts[2]), int(parts[3])))
+                except ValueError:
+                    pass
     return done
+
+
 
 
 def _append_result(graph_name: str, d: int, l: int, n: int,
@@ -156,6 +173,12 @@ def _run_graph(graph_name: str, graph_file: str, done: set) -> None:
             print(f"[{graph_name}] d={d:2d} l={l:2d} -> TRIVIAL (d+l={d+l} > n={n})")
             continue
 
+        num_constraints = math.comb(n, d + l) * math.comb(d + l, l)
+        if num_constraints > CONSTRAINT_LIMIT:
+            _append_result(graph_name, d, l, n, -1, 0.0, "RAM_LIMIT")
+            print(f"[{graph_name}] d={d:2d} l={l:2d} -> RAM_LIMIT (exceeded {RAM_LIMIT_PER_WORKER_GB} GB)")
+            continue
+
         status, size, elapsed, sensor_nodes = _run_solve(graph_path, d, l)
         _append_result(graph_name, d, l, n, size, elapsed, status,
                        sensor_nodes if status == "OK" else None)
@@ -187,6 +210,7 @@ def run_experiments() -> None:
     print(f"Graphs to run : {len(pending)}")
     print(f"Timeout/pair  : {TIMEOUT_SEC // 3600}h")
     print(f"RAM limit     : {RAM_LIMIT_PER_WORKER_GB} GB")
+    print(f"Const limit   : {CONSTRAINT_LIMIT:,}")
     print()
 
     for i, (gn, gf) in enumerate(pending, 1):
@@ -231,6 +255,7 @@ def write_report() -> None:
         "EXPERIMENT REPORT — (d,l)-Disjunct ILP Sensor Set Finder (Part 1)",
         f"Generated : {time.strftime('%Y-%m-%d %H:%M:%S')}",
         f"Timeout   : {TIMEOUT_SEC // 3600}h per (d,l) pair",
+        f"Limit     : {CONSTRAINT_LIMIT:,} constraints",
         "=" * 72,
     ]
 
