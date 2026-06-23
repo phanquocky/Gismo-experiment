@@ -198,7 +198,7 @@ def _run_graph(graph_name: str, graph_file: str, done: set) -> None:
 def run_experiments() -> None:
     all_graphs = _discover_graphs()
     half = len(all_graphs) // 2
-    graphs = all_graphs[:half]
+    graphs = all_graphs[half:]
 
     done = _load_done()
     pending = [(gn, gf) for gn, gf in graphs if any(
@@ -213,7 +213,7 @@ def run_experiments() -> None:
     print(f"Const limit   : {CONSTRAINT_LIMIT:,}")
     print()
 
-    for i, (gn, gf) in enumerate(pending, 1):
+    for i, (gn, gf) in enumerate(reversed(pending), 1):
         _run_graph(gn, gf, done)
         print(f"  >> graph {i}/{len(pending)} finished: {gn}")
 
