@@ -39,7 +39,7 @@ REPORT_FILE  = _BASE / "Using_DL_Disjunct_report.txt"
 
 TIME_LIMIT_SEC = 8 * 3600   # 8 hours per (graph, d, l) task
 RAM_LIMIT_GB   = 32          # GB of virtual memory per worker subprocess
-N_WORKERS      = 4           # parallel subprocess slots
+N_WORKERS      = 16           # parallel subprocess slots
 
 # (d, l) pairs from the spec.
 DL_PAIRS: List[Tuple[int, int]] = [
