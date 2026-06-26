@@ -10,7 +10,6 @@ Task 6: Batch experiments across all datasets for the (d,l) pairs defined in
 
 from __future__ import annotations
 
-import json
 import multiprocessing
 import random
 import sys
@@ -19,20 +18,19 @@ import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from itertools import combinations
 from pathlib import Path
-from typing import Dict, List, Optional, Set, Tuple
+from typing import List, Optional, Set, Tuple
 
 import numpy as np
 
 sys.path.insert(0, str(Path(__file__).parent / "tools"))
 
-from network_to_matrix import network_to_matrix  # noqa: E402
+from network_to_matrix import network_to_matrix, parse_network  # noqa: E402
 
 # ── Paths ─────────────────────────────────────────────────────────────────────
 
 _BASE        = Path(__file__).parent
 DATASETS_DIR = _BASE.parent / "datasets"
 RESULTS_FILE = _BASE / "Using_DL_Disjunct_result.txt"
-RECORDS_FILE = _BASE / "Using_DL_Disjunct_records.json"
 REPORT_FILE  = _BASE / "Using_DL_Disjunct_report.txt"
 
 # ── Experiment config ─────────────────────────────────────────────────────────
@@ -169,6 +167,10 @@ def _worker_subprocess(graph_path: str, d: int, l: int, conn) -> None:
         pass
 
     try:
+        nodes_list, _ = parse_network(graph_path)
+        if d + l > len(nodes_list):
+            conn.send(("TRIVIAL", 0, 0.0, []))
+            return
         sensors, elapsed = dl_sensor_placement(graph_path, d, l)
         conn.send(("OK", len(sensors), elapsed, sensors))
     except MemoryError:
@@ -218,29 +220,23 @@ def _run_one_task(graph_path: str, d: int, l: int) -> tuple:
 
 # ── Result helpers ────────────────────────────────────────────────────────────
 
-def _load_records() -> Dict[str, dict]:
-    if RECORDS_FILE.exists():
-        with open(RECORDS_FILE) as f:
-            return json.load(f)
-    return {}
-
-
-def _save_record(
-    records: Dict[str, dict],
-    dataset_name: str,
-    d: int,
-    l: int,
-    sensor_size: int,
-    elapsed: float,
-    status: str,
-) -> None:
-    key = f"{dataset_name}|d={d}|l={l}"
-    records[key] = dict(
-        dataset=dataset_name, d=d, l=l,
-        sensor_size=sensor_size, elapsed=elapsed, status=status,
-    )
-    with open(RECORDS_FILE, "w") as f:
-        json.dump(records, f, indent=2)
+def _load_done() -> set:
+    """Return set of (dataset_name, d, l) already recorded in RESULTS_FILE."""
+    done: set = set()
+    if not RESULTS_FILE.exists():
+        return done
+    for line in RESULTS_FILE.read_text().splitlines():
+        parts = line.split("\t")
+        if len(parts) < 6:
+            continue
+        try:
+            name = parts[0]
+            d = int(parts[1].split("=")[1])
+            l = int(parts[2].split("=")[1])
+            done.add((name, d, l))
+        except (ValueError, IndexError):
+            pass
+    return done
 
 
 def _append_raw_result(
@@ -264,11 +260,10 @@ def run_experiments() -> None:
       - N_WORKERS threads each manage one subprocess slot.
       - Each subprocess is bounded by TIME_LIMIT_SEC and RAM_LIMIT_GB.
       - Every completed task (OK / TIME_LIMIT / RAM_LIMIT / ERROR) is written
-        to both the JSON checkpoint and the raw results file before the next
-        task starts in that slot — no result is ever lost.
+        to RESULTS_FILE before the next task starts — no result is ever lost.
       - Already-recorded tasks are skipped on resume.
     """
-    records = _load_records()
+    done = _load_done()
 
     dataset_files = sorted(
         f for f in DATASETS_DIR.iterdir() if f.suffix in (".txt", ".mtx", ".edges")
@@ -276,16 +271,16 @@ def run_experiments() -> None:
 
     tasks = [
         (ds_path, d, l)
-        for ds_path in dataset_files
         for d, l in DL_PAIRS
-        if f"{ds_path.name}|d={d}|l={l}" not in records
+        for ds_path in dataset_files
+        if (ds_path.name, d, l) not in done
     ]
 
     total = len(tasks)
     print("=" * 60)
     print(f"Datasets       : {len(dataset_files)}")
     print(f"(d,l) pairs    : {len(DL_PAIRS)}  {DL_PAIRS}")
-    print(f"Total tasks    : {total}  ({len(records)} already done, skipped)")
+    print(f"Total tasks    : {total}  ({len(done)} already done, skipped)")
     print(f"Workers        : {N_WORKERS} parallel subprocesses")
     print(f"Time limit     : {TIME_LIMIT_SEC // 3600}h per task")
     print(f"RAM limit      : {RAM_LIMIT_GB} GB per worker")
@@ -294,7 +289,7 @@ def run_experiments() -> None:
 
     if not tasks:
         print("Nothing to do — all tasks already recorded.")
-        _write_report(records, [f.name for f in dataset_files])
+        _write_report([f.name for f in dataset_files])
         return
 
     write_lock = threading.Lock()
@@ -308,9 +303,7 @@ def run_experiments() -> None:
 
         status, size, elapsed, _ = _run_one_task(str(ds_path), d, l)
 
-        # Write result immediately — under lock so JSON stays consistent
         with write_lock:
-            _save_record(records, name, d, l, size, elapsed, status)
             _append_raw_result(name, d, l, size, elapsed, status)
             completed += 1
             ts_end = time.strftime("%H:%M:%S")
@@ -333,12 +326,33 @@ def run_experiments() -> None:
                 print(f"[UNEXPECTED ERROR] {name} d={d} l={l}: {exc}")
 
     print()
-    _write_report(records, [f.name for f in dataset_files])
+    _write_report([f.name for f in dataset_files])
 
 
 # ── Report generator ──────────────────────────────────────────────────────────
 
-def _write_report(records: Dict[str, dict], dataset_names: List[str]) -> None:
+def _write_report(dataset_names: List[str]) -> None:
+    records: dict = {}
+    if RESULTS_FILE.exists():
+        for line in RESULTS_FILE.read_text().splitlines():
+            parts = line.split("\t")
+            if len(parts) < 6:
+                continue
+            try:
+                name = parts[0]
+                d = int(parts[1].split("=")[1])
+                l = int(parts[2].split("=")[1])
+                size_str = parts[3].split("=")[1]
+                elapsed_str = parts[4].split("=")[1].rstrip("s")
+                status = parts[5].split("=")[1]
+                records[f"{name}|d={d}|l={l}"] = {
+                    "sensor_size": int(size_str),
+                    "elapsed": float(elapsed_str),
+                    "status": status,
+                }
+            except (ValueError, IndexError):
+                pass
+
     col_w = 14
     dl_headers = [f"d={d},l={l}" for d, l in DL_PAIRS]
 
