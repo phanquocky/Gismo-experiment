@@ -24,7 +24,7 @@ import numpy as np
 
 sys.path.insert(0, str(Path(__file__).parent / "tools"))
 
-from network_to_matrix import network_to_matrix, parse_network  # noqa: E402
+from network_to_matrix import network_to_matrix_y_only, parse_network  # noqa: E402
 
 # ── Paths ─────────────────────────────────────────────────────────────────────
 
@@ -33,11 +33,19 @@ DATASETS_DIR = _BASE.parent / "datasets"
 RESULTS_FILE = _BASE / "Using_DL_Disjunct_result.txt"
 REPORT_FILE  = _BASE / "Using_DL_Disjunct_report.txt"
 
+# Sub-dataset paths
+SUB_DATASETS_FILE = _BASE / "sub_dataset.txt"          # persisted list of chosen filenames
+SUB_RESULTS_FILE  = _BASE / "Using_DL_Disjunct_sub_result.txt"
+SUB_REPORT_FILE   = _BASE / "Using_DL_Disjunct_sub_report.txt"
+
 # ── Experiment config ─────────────────────────────────────────────────────────
 
 TIME_LIMIT_SEC = 8 * 3600   # 8 hours per (graph, d, l) task
 RAM_LIMIT_GB   = 32          # GB of virtual memory per worker subprocess
 N_WORKERS      = 16           # parallel subprocess slots
+
+N_SUB_DATASETS  = 20         # number of graphs in the sub-dataset
+SUB_DATASET_SEED = 0         # RNG seed for reproducible sampling
 
 # (d, l) pairs from the spec.
 DL_PAIRS: List[Tuple[int, int]] = [
@@ -75,17 +83,41 @@ def dl_sensor_placement(
         random.seed(seed)
 
     t0 = time.time()
-    nodes, matrix = network_to_matrix(network_file)
+    nodes, matrix = network_to_matrix_y_only(network_file)
     n = len(nodes)
 
-    # Convert once; skip row 0 (all-zeros empty state)
-    mat = np.array(matrix[1:], dtype=np.int8)  # (n_scenarios, 2n)
-
-    active_cols: Set[int] = set(range(2 * n))
-    sensor_indices: Set[int] = set(range(n))
-    essential_indices: Set[int] = set()  # confirmed essential — never retest
+    # y-block only: n columns (x_i columns removed)
+    mat = np.array(matrix[1:], dtype=np.int8)  # (n_scenarios, n)
 
     dl = d + l
+
+    # NO_SOLUTION check: if the full y-only matrix is not (d,l)-disjunctive,
+    # no sensor set can fix it — more columns only help, so all-sensors is the best possible.
+    n_rows = mat.shape[0]
+    if n_rows < dl:
+        return [], time.time() - t0, "NO_SOLUTION"
+
+    is_full_dl = True
+    for _ in range(m_trials):
+        S = rng.choice(n_rows, dl, replace=False)
+        for L_local in combinations(range(dl), l):
+            L_mask = np.zeros(dl, dtype=bool)
+            L_mask[list(L_local)] = True
+            D_mask = ~L_mask
+            d_ok = np.all(mat[S[D_mask], :] == 0, axis=0)
+            l_ok = np.any(mat[S[L_mask], :] == 1, axis=0)
+            if not bool(np.any(d_ok & l_ok)):
+                is_full_dl = False
+                break
+        if not is_full_dl:
+            break
+
+    if not is_full_dl:
+        return [], time.time() - t0, "NO_SOLUTION"
+
+    active_cols: Set[int] = set(range(n))
+    sensor_indices: Set[int] = set(range(n))
+    essential_indices: Set[int] = set()  # confirmed essential — never retest
 
     while True:
         made_progress = False
@@ -93,9 +125,8 @@ def dl_sensor_placement(
         random.shuffle(candidates)
 
         for node_idx in candidates:
-            x_col = node_idx
-            y_col = n + node_idx
-            test_cols = sorted(active_cols - {x_col, y_col})
+            y_col = node_idx
+            test_cols = sorted(active_cols - {y_col})
 
             if len(test_cols) < dl:
                 essential_indices.add(node_idx)
@@ -136,7 +167,6 @@ def dl_sensor_placement(
                     break
 
             if is_dl:
-                active_cols.discard(x_col)
                 active_cols.discard(y_col)
                 sensor_indices.discard(node_idx)
                 made_progress = True
@@ -148,7 +178,7 @@ def dl_sensor_placement(
 
     elapsed = time.time() - t0
     sensor_nodes = [nodes[i] for i in sorted(sensor_indices)]
-    return sensor_nodes, elapsed
+    return sensor_nodes, elapsed, "OK"
 
 
 # ── Subprocess worker ─────────────────────────────────────────────────────────
@@ -171,8 +201,9 @@ def _worker_subprocess(graph_path: str, d: int, l: int, conn) -> None:
         if d + l > len(nodes_list):
             conn.send(("TRIVIAL", 0, 0.0, []))
             return
-        sensors, elapsed = dl_sensor_placement(graph_path, d, l)
-        conn.send(("OK", len(sensors), elapsed, sensors))
+        sensors, elapsed, status = dl_sensor_placement(graph_path, d, l)
+        size = len(sensors) if status == "OK" else -1
+        conn.send((status, size, elapsed, sensors))
     except MemoryError:
         conn.send(("RAM_LIMIT", -1, 0.0, []))
     except (Exception, SystemExit) as exc:
@@ -220,12 +251,12 @@ def _run_one_task(graph_path: str, d: int, l: int) -> tuple:
 
 # ── Result helpers ────────────────────────────────────────────────────────────
 
-def _load_done() -> set:
-    """Return set of (dataset_name, d, l) already recorded in RESULTS_FILE."""
+def _load_done(results_file: Path = RESULTS_FILE) -> set:
+    """Return set of (dataset_name, d, l) already recorded in results_file."""
     done: set = set()
-    if not RESULTS_FILE.exists():
+    if not results_file.exists():
         return done
-    for line in RESULTS_FILE.read_text().splitlines():
+    for line in results_file.read_text().splitlines():
         parts = line.split("\t")
         if len(parts) < 6:
             continue
@@ -241,9 +272,10 @@ def _load_done() -> set:
 
 def _append_raw_result(
     dataset_name: str, d: int, l: int, sensor_size: int, elapsed: float, status: str,
+    results_file: Path = RESULTS_FILE,
 ) -> None:
     ts = time.strftime("%Y-%m-%d %H:%M:%S")
-    with open(RESULTS_FILE, "a") as f:
+    with open(results_file, "a") as f:
         f.write(
             f"{dataset_name}\td={d}\tl={l}\tsensor_size={sensor_size}"
             f"\telapsed={elapsed:.2f}s\tstatus={status}\tts={ts}\n"
@@ -252,22 +284,29 @@ def _append_raw_result(
 
 # ── Batch experiment runner ───────────────────────────────────────────────────
 
-def run_experiments() -> None:
+def run_experiments(
+    dataset_files: Optional[List[Path]] = None,
+    results_file: Path = RESULTS_FILE,
+    report_file: Path = REPORT_FILE,
+) -> None:
     """
     Task 6: Run dl_sensor_placement on every (dataset, d, l) combination.
 
     Layout:
       - N_WORKERS threads each manage one subprocess slot.
       - Each subprocess is bounded by TIME_LIMIT_SEC and RAM_LIMIT_GB.
-      - Every completed task (OK / TIME_LIMIT / RAM_LIMIT / ERROR) is written
-        to RESULTS_FILE before the next task starts — no result is ever lost.
+      - Every completed task (OK / TIME_LIMIT / RAM_LIMIT / ERROR / NO_SOLUTION)
+        is written to results_file before the next task starts.
       - Already-recorded tasks are skipped on resume.
-    """
-    done = _load_done()
 
-    dataset_files = sorted(
-        f for f in DATASETS_DIR.iterdir() if f.suffix in (".txt", ".mtx", ".edges")
-    )
+    Pass dataset_files to restrict to a subset; defaults to all files in DATASETS_DIR.
+    """
+    if dataset_files is None:
+        dataset_files = sorted(
+            f for f in DATASETS_DIR.iterdir() if f.suffix in (".txt", ".mtx", ".edges")
+        )
+
+    done = _load_done(results_file)
 
     tasks = [
         (ds_path, d, l)
@@ -284,12 +323,13 @@ def run_experiments() -> None:
     print(f"Workers        : {N_WORKERS} parallel subprocesses")
     print(f"Time limit     : {TIME_LIMIT_SEC // 3600}h per task")
     print(f"RAM limit      : {RAM_LIMIT_GB} GB per worker")
+    print(f"Results file   : {results_file.name}")
     print("=" * 60)
     print()
 
     if not tasks:
         print("Nothing to do — all tasks already recorded.")
-        _write_report([f.name for f in dataset_files])
+        _write_report([f.name for f in dataset_files], results_file, report_file)
         return
 
     write_lock = threading.Lock()
@@ -304,7 +344,7 @@ def run_experiments() -> None:
         status, size, elapsed, _ = _run_one_task(str(ds_path), d, l)
 
         with write_lock:
-            _append_raw_result(name, d, l, size, elapsed, status)
+            _append_raw_result(name, d, l, size, elapsed, status, results_file)
             completed += 1
             ts_end = time.strftime("%H:%M:%S")
             print(
@@ -326,15 +366,19 @@ def run_experiments() -> None:
                 print(f"[UNEXPECTED ERROR] {name} d={d} l={l}: {exc}")
 
     print()
-    _write_report([f.name for f in dataset_files])
+    _write_report([f.name for f in dataset_files], results_file, report_file)
 
 
 # ── Report generator ──────────────────────────────────────────────────────────
 
-def _write_report(dataset_names: List[str]) -> None:
+def _write_report(
+    dataset_names: List[str],
+    results_file: Path = RESULTS_FILE,
+    report_file: Path = REPORT_FILE,
+) -> None:
     records: dict = {}
-    if RESULTS_FILE.exists():
-        for line in RESULTS_FILE.read_text().splitlines():
+    if results_file.exists():
+        for line in results_file.read_text().splitlines():
             parts = line.split("\t")
             if len(parts) < 6:
                 continue
@@ -400,11 +444,41 @@ def _write_report(dataset_names: List[str]) -> None:
         + [""]
     )
 
-    REPORT_FILE.write_text("\n".join(report_lines) + "\n")
-    print(f"Report saved → {REPORT_FILE}")
+    report_file.write_text("\n".join(report_lines) + "\n")
+    print(f"Report saved → {report_file}")
+
+
+# ── Sub-dataset experiment runner ────────────────────────────────────────────
+
+def run_sub_experiments() -> None:
+    """
+    Randomly sample N_SUB_DATASETS graphs from DATASETS_DIR and run experiments
+    on them, writing results to SUB_RESULTS_FILE / SUB_REPORT_FILE.
+
+    The chosen filenames are saved to SUB_DATASETS_FILE on first run so that
+    resuming always uses the same subset.
+    """
+    if SUB_DATASETS_FILE.exists():
+        names = [n for n in SUB_DATASETS_FILE.read_text().splitlines() if n]
+        chosen = [DATASETS_DIR / name for name in names]
+        print(f"Loaded existing sub-dataset ({len(chosen)} graphs) from {SUB_DATASETS_FILE.name}")
+    else:
+        all_files = sorted(
+            f for f in DATASETS_DIR.iterdir() if f.suffix in (".txt", ".mtx", ".edges")
+        )
+        rng = random.Random(SUB_DATASET_SEED)
+        chosen = sorted(rng.sample(all_files, min(N_SUB_DATASETS, len(all_files))))
+        SUB_DATASETS_FILE.write_text("\n".join(f.name for f in chosen) + "\n")
+        print(f"Sampled {len(chosen)} graphs (seed={SUB_DATASET_SEED}) → saved to {SUB_DATASETS_FILE.name}")
+
+    run_experiments(
+        dataset_files=chosen,
+        results_file=SUB_RESULTS_FILE,
+        report_file=SUB_REPORT_FILE,
+    )
 
 
 # ── Entry point ───────────────────────────────────────────────────────────────
 
 if __name__ == "__main__":
-    run_experiments()
+    run_sub_experiments()

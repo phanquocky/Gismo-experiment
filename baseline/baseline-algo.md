@@ -64,7 +64,7 @@ node 5 fails | 0   | 0   | 0   | 0   | 1   | 0   | 1   | 0   | 1   | 1   |
 
 ### Task 6: Run experiment with Task5's algorithm on all datasets
 - Similar to Task 4, but we will run the algorithm in Task 5 for different (d,l) values instead of k values. The (d,l) values to be tested are:
-  - (d,l) = {(1, 1), (2, 2), (3, 3), (4, 4), (6, 5), (8, 6), (10, 17), (12, 8), (16, 9)}.
+  - (d,l) = {(1, 1), (2, 2), (3, 3), (4, 4), (6, 6), (8, 8), (10, 10), (12, 12), (16, 16)}.
 - Remember to record every time we finish 1 dataset with 1 d,l value, and before start we check the records to run new experiment only.
 - Save the result in a file named `Using_DL_Disjunct_result.txt`.
 - Write a report to summarize the results of Task 5's algorithm on all datasets, including the run time and the sensor set size for each dataset, d value and l value. The report can be in a tabular format for easy comparison.

@@ -1,26 +1,20 @@
 """
-Task 4: Run (d,l)-disjunct ILP experiments on all datasets.
+Run (d,l)-disjunct ILP experiments — first half of graphs (sorted alphabetically).
+Results saved to Using_DDDisjunct_result1.txt.
+Run alongside run_experiment2.py in a separate terminal for parallel coverage.
 
-Strategy per (graph, d, l):
-  - d+l > n  → TRIVIAL (0 constraints, any sensor set works)
-  - otherwise → solve ILP with a 2-day wall-clock timeout
-
-Results are saved incrementally to Using_DDDisjunct_result.txt after each run.
-Before starting, existing results are loaded so completed runs are skipped.
-Graphs run in parallel (up to MAX_WORKERS concurrent processes); within each
-graph, the 9 (d,l) pairs are solved sequentially.
+Each ILP solve runs in a dedicated subprocess so the main process is never
+affected by memory limits or solver crashes.
 """
 
 from __future__ import annotations
 
-import fcntl
+import math
+import multiprocessing
 import os
 import shutil
-import signal
 import sys
 import time
-import resource
-from concurrent.futures import ProcessPoolExecutor, as_completed
 from pathlib import Path
 
 _HERE = Path(__file__).parent
@@ -30,11 +24,12 @@ sys.path.insert(0, str(_HERE.parent / "baseline" / "tools"))
 from network_to_matrix import network_to_matrix  # noqa: E402
 
 DATASETS_DIR = _HERE.parent / "datasets"
-RESULT_FILE  = _HERE / "Using_DDDisjunct_result.txt"
+RESULT_FILE  = _HERE / "Using_DDDisjunct_result2.txt"
+RESULT_FILE_1  = _HERE / "Using_DDDisjunct_result1.txt"
 
-TIMEOUT_SEC              = 2 * 24 * 3600   # 2 days per (d,l) pair
-MAX_WORKERS              = 2
-RAM_LIMIT_PER_WORKER_GB  = 35              # abort a solve if the worker process exceeds this
+TIMEOUT_SEC             = 8 * 3600
+RAM_LIMIT_PER_WORKER_GB = 32
+CONSTRAINT_LIMIT        = 500_000_000
 
 _cplex_bin = shutil.which("cplex")
 if _cplex_bin:
@@ -48,7 +43,6 @@ DL_PAIRS  = [(d, d) for d in _D_VALUES]
 
 
 def _discover_graphs() -> list[tuple[str, str]]:
-    """Return (stem_name, filename) for every graph file in DATASETS_DIR."""
     result = []
     for path in sorted(DATASETS_DIR.iterdir()):
         if path.suffix in (".txt", ".mtx", ".edges") and "report" not in path.name:
@@ -56,24 +50,24 @@ def _discover_graphs() -> list[tuple[str, str]]:
     return result
 
 
-# ── Timeout helper ────────────────────────────────────────────────────────────
-
-class _Timeout(Exception):
-    pass
-
-
-def _alarm_handler(signum, frame):
-    raise _Timeout()
-
-
 # ── Result file helpers ───────────────────────────────────────────────────────
 
 def _load_done() -> set:
-    """Return set of (graph_name, d, l) already recorded in the result file."""
     done: set = set()
     if not RESULT_FILE.exists():
         return done
     for line in RESULT_FILE.read_text().splitlines():
+        if line.startswith("DATA|"):
+            parts = line.split("|")
+            if len(parts) >= 4:
+                try:
+                    done.add((parts[1], int(parts[2]), int(parts[3])))
+                except ValueError:
+                    pass
+
+    if not RESULT_FILE_1.exists():
+        return done
+    for line in RESULT_FILE_1.read_text().splitlines():
         if line.startswith("DATA|"):
             parts = line.split("|")
             if len(parts) >= 4:
@@ -94,109 +88,131 @@ def _append_result(graph_name: str, d: int, l: int, n: int,
         f"|{sensors_str}|{ts}\n"
     )
     with open(RESULT_FILE, "a") as f:
-        fcntl.flock(f, fcntl.LOCK_EX)
-        try:
-            f.write(line)
-        finally:
-            fcntl.flock(f, fcntl.LOCK_UN)
+        f.write(line)
 
 
-# ── Per-graph worker ──────────────────────────────────────────────────────────
+# ── Solve subprocess ──────────────────────────────────────────────────────────
 
-def _run_graph(graph_name: str, graph_file: str, done: set) -> list[str]:
+def _solve_worker(graph_path: str, d: int, l: int, conn) -> None:
     """
-    Run all DL_PAIRS for one graph sequentially.
-    Skips pairs already in `done` (snapshot from run start).
-    Returns a list of result strings for the caller to print.
+    Runs inside a fresh subprocess for each solve.
+    Sets RAM limit here so the main process is never constrained.
+    Sends (status, size, elapsed, sensor_nodes) via pipe — no thread spawned,
+    so this works even when virtual memory is nearly exhausted.
     """
-    from dldisjunct import ilp_dl_disjunct  # imported inside worker for spawn safety
-
-    # Enforce RAM limit for this worker process
+    import resource
     _limit = int(RAM_LIMIT_PER_WORKER_GB * 1024 ** 3)
     try:
         resource.setrlimit(resource.RLIMIT_AS, (_limit, _limit))
     except Exception:
         pass
 
+    from dldisjunct import ilp_dl_disjunct
+    try:
+        sensor_nodes, obj, elapsed = ilp_dl_disjunct(graph_path, d, l)
+        conn.send(("OK", int(obj) if obj is not None else -1, elapsed, sensor_nodes))
+    except MemoryError:
+        conn.send(("RAM_LIMIT", -1, 0.0, []))
+    except (Exception, SystemExit) as exc:
+        conn.send(("ERROR", -1, 0.0, str(exc)[:60]))
+    finally:
+        conn.close()
+
+
+def _run_solve(graph_path: str, d: int, l: int) -> tuple:
+    """
+    Spawn a subprocess for one ILP solve.
+    Returns (status, size, elapsed, sensor_nodes).
+    Timeout and OOM are handled without affecting the main process.
+    """
+    parent_conn, child_conn = multiprocessing.Pipe(duplex=False)
+    proc = multiprocessing.Process(target=_solve_worker, args=(graph_path, d, l, child_conn))
+    t0 = time.time()
+    proc.start()
+    child_conn.close()  # only used in child
+    proc.join(timeout=TIMEOUT_SEC)
+    elapsed = time.time() - t0
+
+    if proc.is_alive():
+        proc.kill()
+        proc.join()
+        parent_conn.close()
+        return "TIME_LIMIT", -1, elapsed, []
+
+    try:
+        if parent_conn.poll(timeout=10):
+            return parent_conn.recv()
+    except Exception:
+        pass
+    finally:
+        parent_conn.close()
+
+    # Subprocess exited without sending — killed by OS OOM or unrecoverable crash
+    return "RAM_LIMIT", -1, elapsed, []
+
+
+# ── Per-graph runner ──────────────────────────────────────────────────────────
+
+def _run_graph(graph_name: str, graph_file: str, done: set) -> None:
     graph_path = str(DATASETS_DIR / graph_file)
     nodes, _ = network_to_matrix(graph_path)
     n = len(nodes)
 
-    msgs = []
     for d, l in DL_PAIRS:
         key = (graph_name, d, l)
 
         if key in done:
-            msgs.append(f"[{graph_name}] d={d:2d} l={l:2d} -> SKIP (already done)")
+            print(f"[{graph_name}] d={d:2d} l={l:2d} -> SKIP (already done)")
             continue
 
         if d + l > n:
             _append_result(graph_name, d, l, n, 0, 0.0, "TRIVIAL")
-            msgs.append(f"[{graph_name}] d={d:2d} l={l:2d} -> TRIVIAL (d+l={d+l} > n={n})")
+            print(f"[{graph_name}] d={d:2d} l={l:2d} -> TRIVIAL (d+l={d+l} > n={n})")
             continue
 
-        signal.signal(signal.SIGALRM, _alarm_handler)
-        signal.alarm(TIMEOUT_SEC)
-        t0 = time.time()
-        try:
-            sensor_nodes, obj, elapsed = ilp_dl_disjunct(graph_path, d, l)
-            signal.alarm(0)
-            size = int(obj) if obj is not None else -1
-            _append_result(graph_name, d, l, n, size, elapsed, "OK", sensor_nodes)
-            msgs.append(
-                f"[{graph_name}] d={d:2d} l={l:2d} -> OK  size={size}  time={elapsed:.1f}s"
-            )
-        except _Timeout:
-            elapsed = time.time() - t0
-            _append_result(graph_name, d, l, n, -1, elapsed, "TIMEOUT")
-            msgs.append(f"[{graph_name}] d={d:2d} l={l:2d} -> TIMEOUT after {elapsed:.1f}s")
-        except MemoryError:
-            signal.alarm(0)
-            elapsed = time.time() - t0
-            _append_result(graph_name, d, l, n, -1, elapsed, "TOO_LARGE")
-            msgs.append(f"[{graph_name}] d={d:2d} l={l:2d} -> TOO_LARGE (exceeded {RAM_LIMIT_PER_WORKER_GB} GB RAM)")
-        except (Exception, SystemExit) as exc:
-            signal.alarm(0)
-            elapsed = time.time() - t0
-            msg = str(exc)[:60].replace("|", ";")
-            _append_result(graph_name, d, l, n, -1, elapsed, f"ERROR_{msg}")
-            msgs.append(f"[{graph_name}] d={d:2d} l={l:2d} -> ERROR: {msg}")
+        num_constraints = math.comb(n, d + l) * math.comb(d + l, l)
+        if num_constraints > CONSTRAINT_LIMIT:
+            _append_result(graph_name, d, l, n, -1, 0.0, "RAM_LIMIT")
+            print(f"[{graph_name}] d={d:2d} l={l:2d} -> RAM_LIMIT (exceeded {RAM_LIMIT_PER_WORKER_GB} GB)")
+            continue
+        
+        # status, size, elapsed, sensor_nodes = _run_solve(graph_path, d, l)
+        # _append_result(graph_name, d, l, n, size, elapsed, status,
+        #                sensor_nodes if status == "OK" else None)
 
-    return msgs
+        # if status == "OK":
+        #     print(f"[{graph_name}] d={d:2d} l={l:2d} -> OK  size={size}  time={elapsed:.1f}s")
+        # elif status == "TIME_LIMIT":
+        #     print(f"[{graph_name}] d={d:2d} l={l:2d} -> TIME_LIMIT after {elapsed:.1f}s (limit={TIMEOUT_SEC // 3600}h)")
+        # elif status == "RAM_LIMIT":
+        #     print(f"[{graph_name}] d={d:2d} l={l:2d} -> RAM_LIMIT (exceeded {RAM_LIMIT_PER_WORKER_GB} GB)")
+        # else:
+        #     print(f"[{graph_name}] d={d:2d} l={l:2d} -> {status}  {sensor_nodes[:60]}")
 
 
 # ── Core experiment loop ──────────────────────────────────────────────────────
 
 def run_experiments() -> None:
-    graphs = _discover_graphs()
-    done   = _load_done()
+    all_graphs = _discover_graphs()
+    # half = len(all_graphs) 
+    graphs = all_graphs
 
+    done = _load_done()
     pending = [(gn, gf) for gn, gf in graphs if any(
         (gn, d, l) not in done for d, l in DL_PAIRS
     )]
 
-    print(f"Graphs found  : {len(graphs)}")
+    print(f"Total graphs  : {len(all_graphs)}  (this file: first )")
     print(f"Already done  : {len(done)} run(s)")
     print(f"Graphs to run : {len(pending)}")
-    print(f"Max workers   : {MAX_WORKERS}")
     print(f"Timeout/pair  : {TIMEOUT_SEC // 3600}h")
+    print(f"RAM limit     : {RAM_LIMIT_PER_WORKER_GB} GB")
+    print(f"Const limit   : {CONSTRAINT_LIMIT:,}")
     print()
 
-    with ProcessPoolExecutor(max_workers=MAX_WORKERS) as pool:
-        futures = {
-            pool.submit(_run_graph, gn, gf, done): gn
-            for gn, gf in pending
-        }
-        completed = 0
-        for fut in as_completed(futures):
-            gn = futures[fut]
-            completed += 1
-            try:
-                for msg in fut.result():
-                    print(msg)
-            except Exception as exc:
-                print(f"[{gn}] WORKER CRASHED: {exc}")
-            print(f"  >> graph {completed}/{len(pending)} finished: {gn}")
+    for i, (gn, gf) in enumerate(pending, 1):
+        _run_graph(gn, gf, done)
+        print(f"  >> graph {i}/{len(pending)} finished: {gn}")
 
 
 # ── Report generator ──────────────────────────────────────────────────────────
@@ -233,9 +249,10 @@ def write_report() -> None:
 
     lines = [
         "=" * 72,
-        "EXPERIMENT REPORT — (d,l)-Disjunct ILP Sensor Set Finder",
+        "EXPERIMENT REPORT — (d,l)-Disjunct ILP Sensor Set Finder (Part 1)",
         f"Generated : {time.strftime('%Y-%m-%d %H:%M:%S')}",
         f"Timeout   : {TIMEOUT_SEC // 3600}h per (d,l) pair",
+        f"Limit     : {CONSTRAINT_LIMIT:,} constraints",
         "=" * 72,
     ]
 
@@ -258,8 +275,10 @@ def write_report() -> None:
                 lines.append(f"  {dl:<10}  {float(r['elapsed']):>8.3f}  {sensors}")
             elif status == "TRIVIAL":
                 lines.append(f"  {dl:<10}  {'—':>8}  TRIVIAL (d+l > n)")
-            elif status == "TIMEOUT":
-                lines.append(f"  {dl:<10}  {float(r['elapsed']):>8.1f}  TIMEOUT")
+            elif status == "TIME_LIMIT":
+                lines.append(f"  {dl:<10}  {float(r['elapsed']):>8.1f}  TIME_LIMIT")
+            elif status == "RAM_LIMIT":
+                lines.append(f"  {dl:<10}  {float(r['elapsed']):>8.3f}  RAM_LIMIT")
             else:
                 lines.append(f"  {dl:<10}  {float(r['elapsed']):>8.3f}  {status[:50]}")
 

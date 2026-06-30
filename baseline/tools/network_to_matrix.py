@@ -111,6 +111,35 @@ def network_to_matrix(file_path: str) -> Tuple[List[int], List[List[int]]]:
     return nodes, matrix
 
 
+def network_to_matrix_y_only(file_path: str) -> Tuple[List[int], List[List[int]]]:
+    """
+    Like network_to_matrix but with the x block removed.
+
+    Returns
+    -------
+    nodes : List[int]
+        Sorted node IDs — column order for the y block.
+    matrix : List[List[int]]
+        (n+1) rows × n columns.
+        Row 0   : empty state (all zeros).
+        Row i+1 : node nodes[i] fails.
+                  Columns 0..n-1 (y block) — y_j = 1 iff nodes[j] ∈ N[nodes[i]].
+    """
+    nodes, adj = parse_network(file_path)
+    n = len(nodes)
+    idx = {v: i for i, v in enumerate(nodes)}
+
+    matrix: List[List[int]] = [[0] * n]  # row 0: empty state
+
+    for v in nodes:
+        row = [0] * n
+        for u in adj[v] | {v}:           # y block: closed neighbourhood
+            row[idx[u]] = 1
+        matrix.append(row)
+
+    return nodes, matrix
+
+
 # ── Pretty-print helper ───────────────────────────────────────────────────────
 
 def print_matrix(nodes: List[int], matrix: List[List[int]], max_nodes: int = 20) -> None:
