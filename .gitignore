@@ -3,3 +3,4 @@ web-gcnf
 __pycache__
 .DS_Store
 *.log
+src/view/output
