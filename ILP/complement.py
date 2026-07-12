@@ -43,7 +43,7 @@ _HERE = Path(__file__).parent
 sys.path.insert(0, str(_HERE))
 sys.path.insert(0, str(_HERE.parent / "baseline" / "tools"))
 
-from network_to_matrix import network_to_matrix, network_to_matrix_y_only  # noqa: E402
+from network_to_matrix import network_to_matrix_y_only, parse_network  # noqa: E402
 
 DATASETS_DIR = _HERE.parent / "datasets"
 RESULT_FILE  = _HERE / "Using_YOnlyDisjunct_result.txt"
@@ -240,7 +240,7 @@ def _run_solve(graph_path: str, d: int, l: int) -> tuple:
 
 def _run_graph(graph_name: str, graph_file: str, done: set) -> None:
     graph_path = str(DATASETS_DIR / graph_file)
-    nodes, _ = network_to_matrix(graph_path)
+    nodes, _ = parse_network(graph_path)
     n = len(nodes)
 
     for d, l in DL_PAIRS:
