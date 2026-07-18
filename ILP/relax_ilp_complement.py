@@ -115,7 +115,7 @@ def _build_dl_witness_set(M: List[List[int]], D: Tuple[int, ...], L: Tuple[int, 
 
 def lp_relax_dl_disjunct_y_only(
     network_file: str, d: int, l: int
-) -> Tuple[List[int], object, float, str, int]:
+) -> Tuple[List[int], object, float, str, int, int]:
     """
     Solve the LP relaxation (z_c in [0,1]) of the minimum (d,l)-disjunct
     sensor-set covering problem, using y_i and its complement y_i' in place
@@ -126,13 +126,17 @@ def lp_relax_dl_disjunct_y_only(
     split has an empty witness set) — in that case the LP status will not be
     "Optimal" and no sensor set is returned.
 
-    Returns (sensor_nodes, size, elapsed, status, violations):
+    Returns (sensor_nodes, size, elapsed, status, violations, success_count):
       status: "OK" (a fully feasible sample was found), "SAMPLE_INFEASIBLE"
         (no sample among NUM_SAMPLES satisfied every constraint — the
         least-violating sample is returned instead), or the raw pulp LP
         status (e.g. "Infeasible") when the LP itself has no solution.
       violations: 0 for "OK", violated-constraint count for
         "SAMPLE_INFEASIBLE", -1 when not applicable.
+      success_count: how many of the NUM_SAMPLES Bernoulli draws were fully
+        feasible (satisfied every witness constraint) — success_count /
+        NUM_SAMPLES is the empirical success probability of the sampling
+        strategy. -1 when not applicable (LP itself infeasible).
     """
     t0 = time.time()
 
@@ -170,32 +174,35 @@ def lp_relax_dl_disjunct_y_only(
     status = pulp.LpStatus[prob.status]
     if status != "Optimal":
         elapsed = time.time() - t0
-        return [], None, elapsed, status, -1
+        return [], None, elapsed, status, -1, -1
 
     z_star = [pulp.value(zc) or 0.0 for zc in z]
-    print(z_star)
+
     feasible_best: set | None = None
     infeasible_best: tuple[set, int] | None = None
+    success_count = 0
 
     for _ in range(NUM_SAMPLES):
         selected = {c for c in range(2 * n) if random.random() < z_star[c]}
         violations = sum(1 for W in witness_sets if selected.isdisjoint(W))
 
         if violations == 0:
+            success_count += 1
             if feasible_best is None or len(selected) < len(feasible_best):
                 feasible_best = selected
         elif infeasible_best is None or violations < infeasible_best[1]:
             infeasible_best = (selected, violations)
 
     elapsed = time.time() - t0
+    print(f"  Success rate: {success_count}/{NUM_SAMPLES} ({100 * success_count / NUM_SAMPLES:.2f}%)")
 
     if feasible_best is not None:
         sensor_nodes = [nodes[c] if c < n else f"{nodes[c - n]}'" for c in sorted(feasible_best)]
-        return sensor_nodes, len(sensor_nodes), elapsed, "OK", 0
+        return sensor_nodes, len(sensor_nodes), elapsed, "OK", 0, success_count
 
     selected, violations = infeasible_best
     sensor_nodes = [nodes[c] if c < n else f"{nodes[c - n]}'" for c in sorted(selected)]
-    return sensor_nodes, len(sensor_nodes), elapsed, "SAMPLE_INFEASIBLE", violations
+    return sensor_nodes, len(sensor_nodes), elapsed, "SAMPLE_INFEASIBLE", violations, success_count
 
 
 # ── Result file helpers ───────────────────────────────────────────────────────
@@ -217,12 +224,13 @@ def _load_done() -> set:
 
 def _append_result(graph_name: str, d: int, l: int, n: int,
                    size, elapsed: float, status: str, violations: int,
-                   sensor_nodes=None) -> None:
+                   sensor_nodes=None, success_count: int = -1) -> None:
     sensors_str = ",".join(map(str, sensor_nodes)) if sensor_nodes else ""
+    success_str = f"{success_count}/{NUM_SAMPLES}" if success_count >= 0 else ""
     ts = time.strftime("%Y-%m-%d %H:%M:%S")
     line = (
         f"DATA|{graph_name}|{d}|{l}|{n}|{size}|{elapsed:.3f}|{status}|{violations}"
-        f"|{sensors_str}|{ts}\n"
+        f"|{sensors_str}|{ts}|{success_str}\n"
     )
     with open(RESULT_FILE, "a") as f:
         f.write(line)
@@ -234,9 +242,9 @@ def _solve_worker(graph_path: str, d: int, l: int, conn) -> None:
     """
     Runs inside a fresh subprocess for each solve.
     Sets RAM limit here so the main process is never constrained.
-    Sends (status, size, elapsed, sensor_nodes, violations) via pipe — no
-    thread spawned, so this works even when virtual memory is nearly
-    exhausted.
+    Sends (status, size, elapsed, sensor_nodes, violations, success_count)
+    via pipe — no thread spawned, so this works even when virtual memory is
+    nearly exhausted.
     """
     import resource
     _limit = int(RAM_LIMIT_PER_WORKER_GB * 1024 ** 3)
@@ -246,15 +254,15 @@ def _solve_worker(graph_path: str, d: int, l: int, conn) -> None:
         pass
 
     try:
-        sensor_nodes, size, elapsed, status, violations = lp_relax_dl_disjunct_y_only(graph_path, d, l)
+        sensor_nodes, size, elapsed, status, violations, success_count = lp_relax_dl_disjunct_y_only(graph_path, d, l)
         if status in ("OK", "SAMPLE_INFEASIBLE"):
-            conn.send((status, size, elapsed, sensor_nodes, violations))
+            conn.send((status, size, elapsed, sensor_nodes, violations, success_count))
         else:
-            conn.send(("INFEASIBLE", -1, elapsed, [], -1))
+            conn.send(("INFEASIBLE", -1, elapsed, [], -1, -1))
     except MemoryError:
-        conn.send(("RAM_LIMIT", -1, 0.0, [], -1))
+        conn.send(("RAM_LIMIT", -1, 0.0, [], -1, -1))
     except (Exception, SystemExit) as exc:
-        conn.send(("ERROR", -1, 0.0, str(exc)[:60], -1))
+        conn.send(("ERROR", -1, 0.0, str(exc)[:60], -1, -1))
     finally:
         conn.close()
 
@@ -262,7 +270,7 @@ def _solve_worker(graph_path: str, d: int, l: int, conn) -> None:
 def _run_solve(graph_path: str, d: int, l: int) -> tuple:
     """
     Spawn a subprocess for one LP-relaxation solve + sample.
-    Returns (status, size, elapsed, sensor_nodes, violations).
+    Returns (status, size, elapsed, sensor_nodes, violations, success_count).
     Timeout and OOM are handled without affecting the main process.
     """
     parent_conn, child_conn = multiprocessing.Pipe(duplex=False)
@@ -277,7 +285,7 @@ def _run_solve(graph_path: str, d: int, l: int) -> tuple:
         proc.kill()
         proc.join()
         parent_conn.close()
-        return "TIME_LIMIT", -1, elapsed, [], -1
+        return "TIME_LIMIT", -1, elapsed, [], -1, -1
 
     try:
         if parent_conn.poll(timeout=10):
@@ -288,7 +296,7 @@ def _run_solve(graph_path: str, d: int, l: int) -> tuple:
         parent_conn.close()
 
     # Subprocess exited without sending — killed by OS OOM or unrecoverable crash
-    return "RAM_LIMIT", -1, elapsed, [], -1
+    return "RAM_LIMIT", -1, elapsed, [], -1, -1
 
 
 # ── Per-(graph, d, l) runner ────────────────────────────────────────────────────
@@ -305,15 +313,19 @@ def _run_graph_dl(graph_name: str, graph_path: str, n: int, d: int, l: int, done
         print(f"[{graph_name}] d={d:2d} l={l:2d} -> TRIVIAL (d+l={d+l} > n={n})")
         return
 
-    status, size, elapsed, sensor_nodes, violations = _run_solve(graph_path, d, l)
+    status, size, elapsed, sensor_nodes, violations, success_count = _run_solve(graph_path, d, l)
     _append_result(graph_name, d, l, n, size, elapsed, status, violations,
-                   sensor_nodes if status in ("OK", "SAMPLE_INFEASIBLE") else None)
+                   sensor_nodes if status in ("OK", "SAMPLE_INFEASIBLE") else None,
+                   success_count)
 
     if status == "OK":
-        print(f"[{graph_name}] d={d:2d} l={l:2d} -> OK  size={size}  time={elapsed:.1f}s")
+        rate = 100 * success_count / NUM_SAMPLES
+        print(f"[{graph_name}] d={d:2d} l={l:2d} -> OK  size={size}  "
+              f"success={success_count}/{NUM_SAMPLES} ({rate:.2f}%)  time={elapsed:.1f}s")
     elif status == "SAMPLE_INFEASIBLE":
         print(f"[{graph_name}] d={d:2d} l={l:2d} -> SAMPLE_INFEASIBLE "
-              f"(best of {NUM_SAMPLES} samples still violates {violations} constraint(s))  time={elapsed:.1f}s")
+              f"(best of {NUM_SAMPLES} samples still violates {violations} constraint(s); "
+              f"success=0/{NUM_SAMPLES})  time={elapsed:.1f}s")
     elif status == "TIME_LIMIT":
         print(f"[{graph_name}] d={d:2d} l={l:2d} -> TIME_LIMIT after {elapsed:.1f}s (limit={TIMEOUT_SEC // 3600}h)")
     elif status == "RAM_LIMIT":
@@ -380,6 +392,7 @@ def _parse_results() -> list[dict]:
             "violations": parts[8],
             "sensors":    parts[9],
             "ts":         parts[10] if len(parts) > 10 else "",
+            "success":    parts[11] if len(parts) > 11 else "",
         })
     return rows
 
@@ -415,7 +428,11 @@ def write_report() -> None:
             status = r["status"]
             if status == "OK":
                 sensors = r["sensors"] if r["sensors"] else "∅"
-                lines.append(f"  {dl:<10}  {float(r['elapsed']):>8.3f}  {sensors}")
+                rate_note = ""
+                if r["success"] and "/" in r["success"]:
+                    succ, total = r["success"].split("/")
+                    rate_note = f"  [success={r['success']} ({100 * int(succ) / int(total):.2f}%)]"
+                lines.append(f"  {dl:<10}  {float(r['elapsed']):>8.3f}  {sensors}{rate_note}")
             elif status == "SAMPLE_INFEASIBLE":
                 sensors = r["sensors"] if r["sensors"] else "∅"
                 lines.append(f"  {dl:<10}  {float(r['elapsed']):>8.3f}  "
