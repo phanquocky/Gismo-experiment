@@ -111,14 +111,49 @@ def network_to_matrix(file_path: str) -> Tuple[List[int], List[List[int]]]:
     return nodes, matrix
 
 
-def network_to_matrix_y_only(file_path: str) -> Tuple[List[int], List[List[int]]]:
+def _dedupe_twin_nodes(nodes: List[int], adj: Dict[int, Set[int]]) -> Tuple[List[int], Dict[int, Set[int]]]:
+    """
+    Collapse "true twin" nodes — distinct nodes with identical closed
+    neighbourhoods N[u] = N[v] — down to one representative per group,
+    dropping the rest along with their incident edges. Twins have
+    identical rows (and, by matrix symmetry, identical columns) in the
+    y-only matrix, so they carry no extra information as either sensors
+    or failing nodes.
+    """
+    seen: Dict[frozenset, int] = {}
+    keep: List[int] = []
+    drop: Set[int] = set()
+    for v in nodes:
+        key = frozenset(adj[v] | {v})
+        if key in seen:
+            drop.add(v)
+        else:
+            seen[key] = v
+            keep.append(v)
+
+    if not drop:
+        return nodes, adj
+
+    new_adj = {v: adj[v] - drop for v in keep}
+    return keep, new_adj
+
+
+def network_to_matrix_y_only(
+    file_path: str, dedupe_twins: bool = False
+) -> Tuple[List[int], List[List[int]]]:
     """
     Like network_to_matrix but with the x block removed.
+
+    dedupe_twins : if True, collapse "true twin" nodes (identical closed
+        neighbourhoods, i.e. identical matrix rows) down to one
+        representative each before building the matrix, so the result is
+        guaranteed to have no two identical rows.
 
     Returns
     -------
     nodes : List[int]
-        Sorted node IDs — column order for the y block.
+        Sorted node IDs — column order for the y block. Shorter than the
+        graph's full node list when dedupe_twins drops duplicates.
     matrix : List[List[int]]
         (n+1) rows × n columns.
         Row 0   : empty state (all zeros).
@@ -126,6 +161,8 @@ def network_to_matrix_y_only(file_path: str) -> Tuple[List[int], List[List[int]]
                   Columns 0..n-1 (y block) — y_j = 1 iff nodes[j] ∈ N[nodes[i]].
     """
     nodes, adj = parse_network(file_path)
+    if dedupe_twins:
+        nodes, adj = _dedupe_twin_nodes(nodes, adj)
     n = len(nodes)
     idx = {v: i for i, v in enumerate(nodes)}
 

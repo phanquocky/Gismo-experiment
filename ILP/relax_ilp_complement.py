@@ -60,8 +60,8 @@ DATASETS_DIR = _HERE.parent / "datasets"
 RESULT_FILE  = _HERE / "Using_YOnlyDisjunct_LPRelax_result.txt"
 
 TIMEOUT_SEC             = 8 * 3600
-RAM_LIMIT_PER_WORKER_GB = 32
-NUM_SAMPLES             = 200000
+RAM_LIMIT_PER_WORKER_GB = 80
+NUM_SAMPLES             = 10000
 
 _cplex_bin = shutil.which("cplex")
 if _cplex_bin:
@@ -70,30 +70,23 @@ if _cplex_bin:
 else:
     print("Solver        : CBC  (cplex not found on PATH)")
 
-_D_VALUES = [1, 2, 3, 4, 6, 8, 10, 12, 16]
+# _D_VALUES = [1, 2, 3, 4, 6, 8, 10, 12, 16]
+_D_VALUES = [1, 2, 3, 4]
 DL_PAIRS  = [(d, d) for d in _D_VALUES]
 
-# Medium-sized graphs only (~300-2300 nodes) — not the 10-86 node toy graphs,
-# not the 11K-1M+ node ones. Picked for a spread of node counts and a mix of
-# graph domains (air, citation, power grid, road, social).
-MEDIUM_GRAPHS = [
+# Small graphs only (10-86 nodes) — the entire small-graph cluster in
+# datasets/ (the next smallest graph after this jumps to 332 nodes).
+SMALL_GRAPHS = [
+    "MadridAdj.txt",
     "inf-USAir97.mtx",
-    "ca-netscience.mtx",
-    "power-494-bus.mtx",
-    "power-685-bus.mtx",
-    "socfb-Caltech36.mtx",
     "power-1138-bus.mtx",
-    "road-euroroad.edges",
-    "socfb-Simmons81.mtx",
-    "power-bcspwr09.mtx",
-    "socfb-Amherst41.mtx",
-    "web-indochina-2004.mtx",
+    "web-edu.mtx"
 ]
 
 
 def _discover_graphs() -> list[tuple[str, str]]:
     result = []
-    for name in MEDIUM_GRAPHS:
+    for name in SMALL_GRAPHS:
         path = DATASETS_DIR / name
         if path.exists():
             result.append((path.stem, path.name))
@@ -143,7 +136,7 @@ def lp_relax_dl_disjunct_y_only(
     """
     t0 = time.time()
 
-    nodes, y_matrix = network_to_matrix_y_only(network_file)
+    nodes, y_matrix = network_to_matrix_y_only(network_file, dedupe_twins=True)
     n = len(nodes)
     Y = y_matrix[1:]  # drop the all-zero empty row -> shape (n, n)
     M = [row + [1 - v for v in row] for row in Y]  # shape (n, 2n): y block + y' block
@@ -298,66 +291,70 @@ def _run_solve(graph_path: str, d: int, l: int) -> tuple:
     return "RAM_LIMIT", -1, elapsed, [], -1
 
 
-# ── Per-graph runner ──────────────────────────────────────────────────────────
+# ── Per-(graph, d, l) runner ────────────────────────────────────────────────────
 
-def _run_graph(graph_name: str, graph_file: str, done: set) -> None:
-    graph_path = str(DATASETS_DIR / graph_file)
-    nodes, _ = parse_network(graph_path)
-    n = len(nodes)
+def _run_graph_dl(graph_name: str, graph_path: str, n: int, d: int, l: int, done: set) -> None:
+    key = (graph_name, d, l)
 
-    for d, l in DL_PAIRS:
-        key = (graph_name, d, l)
+    if key in done:
+        print(f"[{graph_name}] d={d:2d} l={l:2d} -> SKIP (already done)")
+        return
 
-        if key in done:
-            print(f"[{graph_name}] d={d:2d} l={l:2d} -> SKIP (already done)")
-            continue
+    if d + l > n:
+        _append_result(graph_name, d, l, n, 0, 0.0, "TRIVIAL", -1)
+        print(f"[{graph_name}] d={d:2d} l={l:2d} -> TRIVIAL (d+l={d+l} > n={n})")
+        return
 
-        if d + l > n:
-            _append_result(graph_name, d, l, n, 0, 0.0, "TRIVIAL", -1)
-            print(f"[{graph_name}] d={d:2d} l={l:2d} -> TRIVIAL (d+l={d+l} > n={n})")
-            continue
+    status, size, elapsed, sensor_nodes, violations = _run_solve(graph_path, d, l)
+    _append_result(graph_name, d, l, n, size, elapsed, status, violations,
+                   sensor_nodes if status in ("OK", "SAMPLE_INFEASIBLE") else None)
 
-        status, size, elapsed, sensor_nodes, violations = _run_solve(graph_path, d, l)
-        _append_result(graph_name, d, l, n, size, elapsed, status, violations,
-                       sensor_nodes if status in ("OK", "SAMPLE_INFEASIBLE") else None)
-
-        if status == "OK":
-            print(f"[{graph_name}] d={d:2d} l={l:2d} -> OK  size={size}  time={elapsed:.1f}s")
-        elif status == "SAMPLE_INFEASIBLE":
-            print(f"[{graph_name}] d={d:2d} l={l:2d} -> SAMPLE_INFEASIBLE "
-                  f"(best of {NUM_SAMPLES} samples still violates {violations} constraint(s))  time={elapsed:.1f}s")
-        elif status == "TIME_LIMIT":
-            print(f"[{graph_name}] d={d:2d} l={l:2d} -> TIME_LIMIT after {elapsed:.1f}s (limit={TIMEOUT_SEC // 3600}h)")
-        elif status == "RAM_LIMIT":
-            print(f"[{graph_name}] d={d:2d} l={l:2d} -> RAM_LIMIT (exceeded {RAM_LIMIT_PER_WORKER_GB} GB)")
-        elif status == "INFEASIBLE":
-            print(f"[{graph_name}] d={d:2d} l={l:2d} -> INFEASIBLE (no y_i-only LP relaxation exists)")
-        else:
-            print(f"[{graph_name}] d={d:2d} l={l:2d} -> {status}  {sensor_nodes[:60]}")
+    if status == "OK":
+        print(f"[{graph_name}] d={d:2d} l={l:2d} -> OK  size={size}  time={elapsed:.1f}s")
+    elif status == "SAMPLE_INFEASIBLE":
+        print(f"[{graph_name}] d={d:2d} l={l:2d} -> SAMPLE_INFEASIBLE "
+              f"(best of {NUM_SAMPLES} samples still violates {violations} constraint(s))  time={elapsed:.1f}s")
+    elif status == "TIME_LIMIT":
+        print(f"[{graph_name}] d={d:2d} l={l:2d} -> TIME_LIMIT after {elapsed:.1f}s (limit={TIMEOUT_SEC // 3600}h)")
+    elif status == "RAM_LIMIT":
+        print(f"[{graph_name}] d={d:2d} l={l:2d} -> RAM_LIMIT (exceeded {RAM_LIMIT_PER_WORKER_GB} GB)")
+    elif status == "INFEASIBLE":
+        print(f"[{graph_name}] d={d:2d} l={l:2d} -> INFEASIBLE (no y_i-only LP relaxation exists)")
+    else:
+        print(f"[{graph_name}] d={d:2d} l={l:2d} -> {status}  {sensor_nodes[:60]}")
 
 
 # ── Core experiment loop ──────────────────────────────────────────────────────
 
 def run_experiments() -> None:
     all_graphs = _discover_graphs()
-    graphs = all_graphs
-
     done = _load_done()
-    pending = [(gn, gf) for gn, gf in graphs if any(
-        (gn, d, l) not in done for d, l in DL_PAIRS
-    )]
+
+    # Parse each graph's node count once up front so the (d,l)-outer loop
+    # doesn't re-parse the network file for every pair.
+    graph_info = []
+    for gn, gf in all_graphs:
+        graph_path = str(DATASETS_DIR / gf)
+        nodes, _ = parse_network(graph_path)
+        graph_info.append((gn, graph_path, len(nodes)))
+
+    pending = sum(
+        1 for gn, _, _ in graph_info for d, l in DL_PAIRS if (gn, d, l) not in done
+    )
 
     print(f"Total graphs  : {len(all_graphs)}")
     print(f"Already done  : {len(done)} run(s)")
-    print(f"Graphs to run : {len(pending)}")
+    print(f"Runs to do    : {pending}")
     print(f"Timeout/pair  : {TIMEOUT_SEC // 3600}h")
     print(f"RAM limit     : {RAM_LIMIT_PER_WORKER_GB} GB")
     print(f"Samples/pair  : {NUM_SAMPLES}")
     print()
 
-    for i, (gn, gf) in enumerate(pending, 1):
-        _run_graph(gn, gf, done)
-        print(f"  >> graph {i}/{len(pending)} finished: {gn}")
+    for d, l in DL_PAIRS:
+        print(f"=== (d,l) = ({d},{l}) ===")
+        for gn, graph_path, n in graph_info:
+            _run_graph_dl(gn, graph_path, n, d, l, done)
+        print(f"  >> (d,l)=({d},{l}) finished")
 
 
 # ── Report generator ──────────────────────────────────────────────────────────
