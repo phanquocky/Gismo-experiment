@@ -1,8 +1,9 @@
 #!/usr/bin/env python3
 """Remove closed twins from every graph in ``datasets/``.
 
-For every closed-twin equivalence class, the smallest-labelled vertex is kept.
-The process is repeated because removing vertices can create new closed twins.
+Only the largest connected component of each input graph is retained. Then, for
+every closed-twin equivalence class, the smallest-labelled vertex is kept. The
+process is repeated because removing vertices can create new closed twins.
 Output vertices are relabelled consecutively from 1 and written to
 ``standardized_dataset/`` using the original file names.
 """
@@ -158,6 +159,35 @@ def remove_closed_twins(graph: Graph) -> tuple[Graph, int, int]:
             del graph[vertex]
 
 
+def keep_largest_connected_component(graph: Graph) -> tuple[Graph, int, int]:
+    """Return the largest component, number of components, and removed vertices.
+
+    Ties are resolved deterministically by keeping the component whose smallest
+    vertex label is smallest.
+    """
+    unseen = set(graph)
+    components: list[set[int]] = []
+    while unseen:
+        root = min(unseen)
+        unseen.remove(root)
+        component = {root}
+        stack = [root]
+        while stack:
+            vertex = stack.pop()
+            new_vertices = graph[vertex] & unseen
+            unseen.difference_update(new_vertices)
+            component.update(new_vertices)
+            stack.extend(new_vertices)
+        components.append(component)
+
+    largest = min(components, key=lambda component: (-len(component), min(component)))
+    reduced_graph = {
+        vertex: graph[vertex] & largest
+        for vertex in largest
+    }
+    return reduced_graph, len(components), len(graph) - len(largest)
+
+
 def relabel_graph(graph: Graph) -> Graph:
     labels = {old: new for new, old in enumerate(sorted(graph), start=1)}
     return {
@@ -198,15 +228,40 @@ def has_closed_twins(graph: Graph) -> bool:
     return False
 
 
-def standardize_file(source: Path, destination: Path) -> tuple[int, int, int]:
+def is_connected(graph: Graph) -> bool:
+    if not graph:
+        return False
+    root = next(iter(graph))
+    visited = {root}
+    stack = [root]
+    while stack:
+        vertex = stack.pop()
+        new_vertices = graph[vertex] - visited
+        visited.update(new_vertices)
+        stack.extend(new_vertices)
+    return len(visited) == len(graph)
+
+
+def standardize_file(
+    source: Path, destination: Path
+) -> tuple[int, int, int, int, int]:
     graph = read_graph(source)
     original_vertices = len(graph)
-    graph, removed, rounds = remove_closed_twins(graph)
+    graph, component_count, component_removed = keep_largest_connected_component(graph)
+    graph, twin_removed, rounds = remove_closed_twins(graph)
     graph = relabel_graph(graph)
     if has_closed_twins(graph):
         raise RuntimeError("internal error: closed twins remain after standardization")
+    if not is_connected(graph):
+        raise RuntimeError("internal error: standardized graph is not connected")
     write_graph(destination, graph)
-    return original_vertices, removed, rounds
+    return (
+        original_vertices,
+        twin_removed,
+        rounds,
+        component_count,
+        component_removed,
+    )
 
 
 def main() -> int:
@@ -233,11 +288,15 @@ def main() -> int:
     print(f"Found {len(sources)} graph(s) in {args.input}")
     for index, source in enumerate(sources, start=1):
         destination = args.output / source.name
-        original, removed, rounds = standardize_file(source, destination)
+        original, twin_removed, rounds, components, component_removed = standardize_file(
+            source, destination
+        )
+        remaining = original - twin_removed - component_removed
         print(
             f"[{index:02d}/{len(sources):02d}] {source.name}: "
-            f"{original} -> {original - removed} vertices, "
-            f"removed {removed} in {rounds} round(s)"
+            f"{original} -> {remaining} vertices; "
+            f"closed-twin removed={twin_removed} ({rounds} round(s)); "
+            f"components={components}, outside-largest removed={component_removed}"
         )
     return 0
 
