@@ -426,7 +426,7 @@ def run_worker(
             elapsed_seconds=f"{time.perf_counter() - start:.9f}",
             detail=str(exc) or "Vuot gioi han RAM",
         )
-    except (OSError, RuntimeError, ValueError) as exc:
+    except Exception as exc:
         # A standardized graph should have a solution. Failure to produce one is
         # therefore an invalid algorithm result for this experiment.
         result.update(
@@ -491,8 +491,18 @@ def run_dataset_process(
             limit_status = "TIMEOUT"
             break
         try:
-            observed_peak_ram = max(observed_peak_ram, worker.memory_info().rss)
-        except psutil.Error:
+            try:
+                processes = [worker, *worker.children(recursive=True)]
+            except (psutil.Error, OSError):
+                processes = [worker]
+            current_ram = 0
+            for monitored_process in processes:
+                try:
+                    current_ram += monitored_process.memory_info().rss
+                except psutil.Error:
+                    pass
+            observed_peak_ram = max(observed_peak_ram, current_ram)
+        except (psutil.Error, OSError):
             pass
         if observed_peak_ram > ram_limit_bytes:
             limit_status = "RAM_LIMITED"
@@ -526,7 +536,26 @@ def run_dataset_process(
 
     try:
         if result_path.exists():
-            return json.loads(result_path.read_text(encoding="utf-8"))
+            result = json.loads(result_path.read_text(encoding="utf-8"))
+            reported_peak = result.get("peak_ram_bytes") or 0
+            result["peak_ram_bytes"] = max(int(reported_peak), observed_peak_ram)
+            if process.returncode:
+                worker_error = stderr.strip()[-1000:]
+                result["elapsed_seconds"] = result.get("elapsed_seconds") or (
+                    f"{time.perf_counter() - start:.9f}"
+                )
+                if process.returncode == -signal.SIGTERM:
+                    result["status"] = "TIMEOUT"
+                elif process.returncode in {
+                    -signal.SIGKILL,
+                    -signal.SIGABRT,
+                    -signal.SIGSEGV,
+                }:
+                    result["status"] = "RAM_LIMITED"
+                if worker_error:
+                    old_detail = str(result.get("detail") or "")
+                    result["detail"] = f"{old_detail} | {worker_error}".strip(" |")
+            return result
         detail = stderr.strip()[-1000:] or f"worker exit code {process.returncode}"
         killed_for_memory = process.returncode in {
             -signal.SIGKILL,
@@ -561,6 +590,24 @@ RESULT_FIELDS = [
     "solution_file",
     "detail",
 ]
+
+
+def completed_datasets(csv_path: Path) -> set[str]:
+    """Lay cac dataset da co mot dong ket qua hoan chinh de resume batch."""
+    if not csv_path.exists() or csv_path.stat().st_size == 0:
+        return set()
+    with csv_path.open("r", encoding="utf-8", newline="") as source:
+        reader = csv.DictReader(source)
+        if reader.fieldnames is None or not {"dataset", "status"} <= set(reader.fieldnames):
+            raise ValueError(
+                f"CSV {csv_path} thieu cot bat buoc dataset/status"
+            )
+        return {
+            (row.get("dataset") or "").strip()
+            for row in reader
+            if (row.get("dataset") or "").strip()
+            and (row.get("status") or "").strip()
+        }
 
 
 def append_csv_result(csv_path: Path, result: dict[str, object]) -> None:
@@ -634,14 +681,23 @@ def main() -> None:
         parser.error(f"Khong the sap xep graph theo so dinh: {exc}")
 
     ram_limit_bytes = int(args.ram_limit_gb * 1024**3)
-    # A new run replaces the old summary; each row is flushed immediately.
-    args.output_csv.unlink(missing_ok=True)
+    try:
+        already_completed = completed_datasets(args.output_csv)
+    except (OSError, ValueError, csv.Error) as exc:
+        parser.error(f"Khong the doc CSV ket qua cu: {exc}")
+    pending_graphs = [
+        path for path in graph_paths if path.name not in already_completed
+    ]
     print(
-        f"Tim thay {len(graph_paths)} graph. Timeout={args.timeout:g}s, "
+        f"Tim thay {len(graph_paths)} graph; da co ket qua={len(graph_paths) - len(pending_graphs)}, "
+        f"con lai={len(pending_graphs)}. Timeout={args.timeout:g}s, "
         f"RAM limit={args.ram_limit_gb:g} GiB/graph. "
         "Thu tu: so dinh tang dan."
     )
-    for index, graph_path in enumerate(graph_paths, start=1):
+    if not pending_graphs:
+        print(f"Khong co graph nao can chay. Ket qua: {args.output_csv}")
+        return
+    for index, graph_path in enumerate(pending_graphs, start=1):
         result = run_dataset_process(
             script_path,
             graph_path.resolve(),
@@ -651,7 +707,7 @@ def main() -> None:
         )
         append_csv_result(args.output_csv, result)
         print(
-            f"[{index:02d}/{len(graph_paths):02d}] {graph_path.name}: "
+            f"[{index:02d}/{len(pending_graphs):02d}] {graph_path.name}: "
             f"STATUS={result['status']} | time={result['elapsed_seconds']}s | "
             f"code_size={result['code_size'] or 'N/A'}"
         )

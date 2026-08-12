@@ -1,26 +1,72 @@
 #!/usr/bin/env python3
-"""ID-Greedy khong khoi tao universe va cac distinguishing set.
+"""Chay ID-Greedy without-universe tren cac graph da chuan hoa.
 
-File graph la edge-list cua graph vo huong. Moi dong chua hai nhan dinh;
-dong chi co mot nhan co the duoc dung de khai bao mot dinh co lap.
+Mac dinh script duyet toan bo ``standardized_dataset/`` theo so dinh tang dan.
+Moi graph chay trong mot worker rieng voi timeout 8 gio va gioi han RAM 64 GiB.
+Tong ket duoc ghi vao CSV; nghiem hoan tat duoc ghi thanh file rieng.
 """
 
 from __future__ import annotations
 
 import argparse
+import importlib.util
 import time
 from pathlib import Path
 
 
 Graph = dict[int, set[int]]
+DEFAULT_TIMEOUT_SECONDS = 8 * 60 * 60
+DEFAULT_RAM_LIMIT_GB = 64.0
+SUPPORTED_SUFFIXES = {".txt", ".mtx", ".edges"}
+
+
+def declared_vertex_count(path: Path) -> int:
+    """Chi doc header de sap xep graph theo so dinh."""
+    with path.open("r", encoding="utf-8") as graph_file:
+        if path.suffix.lower() == ".mtx":
+            for raw_line in graph_file:
+                line = raw_line.strip()
+                if not line or line.startswith("%"):
+                    continue
+                fields = line.split()
+                if len(fields) >= 2:
+                    rows, columns = int(fields[0]), int(fields[1])
+                    if rows != columns:
+                        raise ValueError(f"Matrix khong vuong: {path}")
+                    return rows
+        else:
+            for raw_line in graph_file:
+                line = raw_line.strip()
+                if not line:
+                    continue
+                if line.startswith(("%", "#")):
+                    fields = line.lstrip("%#").split()
+                    if len(fields) == 3:
+                        _, rows, columns = map(int, fields)
+                        if rows == columns:
+                            return rows
+                    continue
+                break
+    raise ValueError(f"Khong tim thay so dinh khai bao trong {path}")
 
 
 def _read_edge_list(lines: list[str]) -> Graph:
     """Doc cac dong edge-list."""
     graph: Graph = {}
+    declared_vertices: int | None = None
     for line_number, raw_line in enumerate(lines, start=1):
         line = raw_line.split("#", 1)[0].strip()
         if not line:
+            continue
+        if line.startswith("%"):
+            fields = line.lstrip("%").split()
+            if len(fields) == 3:
+                try:
+                    _, rows, columns = map(int, fields)
+                except ValueError:
+                    continue
+                if rows == columns:
+                    declared_vertices = rows
             continue
 
         fields = line.split()
@@ -41,6 +87,12 @@ def _read_edge_list(lines: list[str]) -> Graph:
             if u != v:
                 graph[u].add(v)
                 graph[v].add(u)
+
+    if declared_vertices is not None:
+        if graph and max(graph) > declared_vertices:
+            raise ValueError("Nhan dinh vuot qua kich thuoc graph da khai bao")
+        for vertex in range(1, declared_vertices + 1):
+            graph.setdefault(vertex, set())
 
     if not graph:
         raise ValueError("Graph rong")
@@ -219,27 +271,167 @@ def is_identifying_code(graph: Graph, code: set[int]) -> tuple[bool, str]:
     return True, "Thoa man tinh chat Identifying Code"
 
 
+def _load_batch_support():
+    """Tai resource-isolated batch harness dung chung voi ban co universe."""
+    path = Path(__file__).resolve().with_name("greedy-set-cover.py")
+    spec = importlib.util.spec_from_file_location("greedy_set_cover_batch_support", path)
+    if spec is None or spec.loader is None:
+        raise ImportError(f"Khong the tai batch harness tu {path}")
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
+def run_worker(
+    graph_path: Path,
+    result_path: Path,
+    solution_directory: Path,
+    batch_support,
+) -> int:
+    """Chay va kiem chung mot dataset trong worker without-universe."""
+    start = time.perf_counter()
+    result: dict[str, object] = {
+        "dataset": graph_path.name,
+        "status": "INVALID",
+        "vertices": "",
+        "edges": "",
+        "code_size": "",
+        "elapsed_seconds": "",
+        "peak_ram_bytes": "",
+        "solution_file": "",
+        "detail": "",
+    }
+    try:
+        graph = read_graph(graph_path)
+        result["vertices"] = len(graph)
+        result["edges"] = sum(map(len, graph.values())) // 2
+
+        algorithm_start = time.perf_counter()
+        code = id_greedy_without_universe(graph)
+        algorithm_elapsed = time.perf_counter() - algorithm_start
+        valid, message = is_identifying_code(graph, code)
+
+        solution_directory.mkdir(parents=True, exist_ok=True)
+        solution_path = solution_directory / f"{graph_path.name}.code.txt"
+        temporary_solution = solution_path.with_name(solution_path.name + ".tmp")
+        temporary_solution.write_text(
+            "\n".join(map(str, sorted(code))) + "\n", encoding="utf-8"
+        )
+        temporary_solution.replace(solution_path)
+        result.update(
+            status="VALID" if valid else "INVALID",
+            code_size=len(code),
+            elapsed_seconds=f"{algorithm_elapsed:.9f}",
+            solution_file=str(solution_path),
+            detail=message,
+        )
+    except MemoryError as exc:
+        result.update(
+            status="RAM_LIMITED",
+            elapsed_seconds=f"{time.perf_counter() - start:.9f}",
+            detail=str(exc) or "Vuot gioi han RAM",
+        )
+    except Exception as exc:
+        result.update(
+            status="INVALID",
+            elapsed_seconds=f"{time.perf_counter() - start:.9f}",
+            detail=f"{type(exc).__name__}: {exc}",
+        )
+    finally:
+        result["peak_ram_bytes"] = batch_support._peak_ram_bytes()
+        batch_support._write_json_atomic(result_path, result)
+    return 0
+
+
 def main() -> None:
-    default_graph = '/Users/admin/Documents/master/AnhThach/experiment/datasets/socfb-Amherst41.mtx'
+    script_path = Path(__file__).resolve()
+    project_directory = script_path.parent.parent
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument(
-        "graph", nargs="?", type=Path, default=default_graph, help="file edge-list"
+        "graphs", nargs="*", type=Path,
+        help="graph tuy chon; mac dinh chay tat ca standardized_dataset/",
     )
+    parser.add_argument("--timeout", type=float, default=DEFAULT_TIMEOUT_SECONDS)
+    parser.add_argument("--ram-limit-gb", type=float, default=DEFAULT_RAM_LIMIT_GB)
+    parser.add_argument(
+        "--output-csv",
+        type=Path,
+        default=script_path.parent / "greedy-set-cover-wou-results.csv",
+    )
+    parser.add_argument(
+        "--solution-dir",
+        type=Path,
+        default=script_path.parent / "greedy-set-cover-wou-solutions",
+    )
+    parser.add_argument("--worker", type=Path, help=argparse.SUPPRESS)
+    parser.add_argument("--result-file", type=Path, help=argparse.SUPPRESS)
+    parser.add_argument("--worker-ram-bytes", type=int, help=argparse.SUPPRESS)
     args = parser.parse_args()
 
     try:
-        graph = read_graph(args.graph)
-        start = time.perf_counter()
-        code = id_greedy_without_universe(graph)
-        elapsed = time.perf_counter() - start
-        valid, message = is_identifying_code(graph, code)
-    except (OSError, ValueError) as exc:
-        parser.exit(1, f"Loi: {exc}\n")
+        batch_support = _load_batch_support()
+    except (OSError, ImportError) as exc:
+        parser.exit(1, f"Loi tai batch harness: {exc}\n")
 
-    print(f"C_greedy_wou: {sorted(code)}")
-    print(f"Size cua output: {len(code)}")
-    print(f"Thoi gian chay thuat toan: {elapsed:.9f} giay")
-    print(f"Kiem tra Identifying Code: {'DAT' if valid else 'KHONG DAT'} - {message}")
+    if args.worker is not None:
+        if args.result_file is None or args.worker_ram_bytes is None:
+            parser.error("--worker requires --result-file and --worker-ram-bytes")
+        batch_support._set_ram_limit(args.worker_ram_bytes)
+        raise SystemExit(
+            run_worker(args.worker, args.result_file, args.solution_dir, batch_support)
+        )
+    if args.timeout <= 0:
+        parser.error("--timeout phai lon hon 0")
+    if args.ram_limit_gb <= 0:
+        parser.error("--ram-limit-gb phai lon hon 0")
+
+    dataset_directory = project_directory / "standardized_dataset"
+    graph_paths = args.graphs or list(
+        path for path in dataset_directory.iterdir()
+        if path.is_file() and path.suffix.lower() in SUPPORTED_SUFFIXES
+    )
+    if not graph_paths:
+        parser.error(f"Khong tim thay graph trong {dataset_directory}")
+    try:
+        graph_paths = sorted(
+            graph_paths,
+            key=lambda path: (declared_vertex_count(path), path.name.lower()),
+        )
+    except (OSError, ValueError) as exc:
+        parser.error(f"Khong the sap xep graph theo so dinh: {exc}")
+
+    ram_limit_bytes = int(args.ram_limit_gb * 1024**3)
+    try:
+        already_completed = batch_support.completed_datasets(args.output_csv)
+    except (OSError, ValueError) as exc:
+        parser.error(f"Khong the doc CSV ket qua cu: {exc}")
+    pending_graphs = [
+        path for path in graph_paths if path.name not in already_completed
+    ]
+    print(
+        f"Tim thay {len(graph_paths)} graph; da co ket qua={len(graph_paths) - len(pending_graphs)}, "
+        f"con lai={len(pending_graphs)}. Timeout={args.timeout:g}s, "
+        f"RAM limit={args.ram_limit_gb:g} GiB/graph. "
+        "Thuat toan=WITHOUT_UNIVERSE. Thu tu: so dinh tang dan."
+    )
+    if not pending_graphs:
+        print(f"Khong co graph nao can chay. Ket qua: {args.output_csv}")
+        return
+    for index, graph_path in enumerate(pending_graphs, start=1):
+        result = batch_support.run_dataset_process(
+            script_path,
+            graph_path.resolve(),
+            args.solution_dir.resolve(),
+            args.timeout,
+            ram_limit_bytes,
+        )
+        batch_support.append_csv_result(args.output_csv, result)
+        print(
+            f"[{index:02d}/{len(pending_graphs):02d}] {graph_path.name}: "
+            f"STATUS={result['status']} | time={result['elapsed_seconds']}s | "
+            f"code_size={result['code_size'] or 'N/A'}"
+        )
+    print(f"Da ghi tong ket: {args.output_csv}")
 
 
 if __name__ == "__main__":

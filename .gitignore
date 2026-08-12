@@ -5,3 +5,4 @@ __pycache__
 *.log
 src/view/output
 trash/
+discriminating_code_set/
