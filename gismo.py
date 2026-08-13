@@ -422,19 +422,20 @@ def run_isolated(
         result_path.unlink(missing_ok=True)
 
 
-def completed_datasets(csv_path: Path) -> set[str]:
+def completed_datasets(csv_path: Path, retry_invalid: bool = False) -> set[str]:
     if not csv_path.exists() or csv_path.stat().st_size == 0:
         return set()
     with csv_path.open("r", encoding="utf-8", newline="") as source:
         reader = csv.DictReader(source)
         if reader.fieldnames is None or not {"dataset", "status"} <= set(reader.fieldnames):
             raise ValueError(f"CSV {csv_path} thieu cot dataset/status")
-        return {
-            (row.get("dataset") or "").strip()
-            for row in reader
-            if (row.get("dataset") or "").strip()
-            and (row.get("status") or "").strip()
-        }
+        completed: set[str] = set()
+        for row in reader:
+            dataset = (row.get("dataset") or "").strip()
+            status = (row.get("status") or "").strip()
+            if dataset and status and not (retry_invalid and status == "INVALID"):
+                completed.add(dataset)
+        return completed
 
 
 def append_result(csv_path: Path, result: dict[str, object]) -> None:
@@ -445,6 +446,22 @@ def append_result(csv_path: Path, result: dict[str, object]) -> None:
             writer.writeheader()
         writer.writerow({field: result.get(field, "") for field in RESULT_FIELDS})
         output.flush()
+
+
+def remove_results(csv_path: Path, datasets: set[str]) -> None:
+    """Xoa cac dong cu sap retry de CSV chi co mot ket qua moi dataset."""
+    if not datasets or not csv_path.exists():
+        return
+    with csv_path.open("r", encoding="utf-8", newline="") as source:
+        reader = csv.DictReader(source)
+        rows = [row for row in reader if row.get("dataset") not in datasets]
+    temporary = csv_path.with_name(csv_path.name + ".tmp")
+    with temporary.open("w", encoding="utf-8", newline="") as output:
+        writer = csv.DictWriter(output, fieldnames=RESULT_FIELDS)
+        writer.writeheader()
+        for row in rows:
+            writer.writerow({field: row.get(field, "") for field in RESULT_FIELDS})
+    temporary.replace(csv_path)
 
 
 def main() -> None:
@@ -458,6 +475,11 @@ def main() -> None:
     parser.add_argument("--encoder-path", type=Path, default=ENCODE_NETWORK_PATH)
     parser.add_argument("--output-csv", type=Path, default=project_directory / "gismo-results.csv")
     parser.add_argument("--solution-dir", type=Path, default=project_directory / "gismo-solutions")
+    parser.add_argument(
+        "--retry-invalid",
+        action="store_true",
+        help="chay lai cac dataset dang co STATUS=INVALID trong CSV",
+    )
     parser.add_argument("--worker", type=Path, help=argparse.SUPPRESS)
     parser.add_argument("--result-file", type=Path, help=argparse.SUPPRESS)
     parser.add_argument("--worker-ram-bytes", type=int, help=argparse.SUPPRESS)
@@ -499,8 +521,10 @@ def main() -> None:
         graph_paths,
         key=lambda path: (declared_vertex_count(path), path.name.lower()),
     )
-    done = completed_datasets(args.output_csv)
+    done = completed_datasets(args.output_csv, retry_invalid=args.retry_invalid)
     pending = [path for path in graph_paths if path.name not in done]
+    if args.retry_invalid:
+        remove_results(args.output_csv, {path.name for path in pending})
     print(
         f"Tim thay {len(graph_paths)} graph; da co ket qua={len(graph_paths)-len(pending)}, "
         f"con lai={len(pending)}. k={K}, timeout={args.timeout:g}s, "
@@ -527,6 +551,9 @@ def main() -> None:
             f"STATUS={result['status']} | time={result['elapsed_seconds']}s | "
             f"code_size={result['code_size'] or 'N/A'}"
         )
+        if result["status"] != "VALID":
+            detail = str(result.get("detail") or "Khong co thong tin loi")
+            print(f"  detail: {detail}")
     print(f"Da ghi tong ket: {args.output_csv}")
 
 

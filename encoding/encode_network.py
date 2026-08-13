@@ -34,8 +34,6 @@ import os
 import pathlib
 import signal
 import sys
-from ilp_encoding import ILPEncoding
-from gis_encoding import GISEncoding
 
 PROJECT_DIR = os.getenv('PROJECT_DIR')
 
@@ -91,8 +89,10 @@ log_message("Initialising {encoding} instance".format(encoding=args.encoding))
 ic_instance = None
 
 if args.encoding == 'gis':
+    from gis_encoding import GISEncoding
     ic_instance = GISEncoding()
 elif args.encoding == 'ilp':
+    from ilp_encoding import ILPEncoding
     ic_instance = ILPEncoding()
 
 log_message("Building {encoding} instance.".format(encoding=args.encoding))
