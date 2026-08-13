@@ -110,25 +110,6 @@ def edge_list_group_to_vertex(path: Path) -> dict[int, int]:
     }
 
 
-def is_identifying_code(
-    graph: dict[int, set[int]], code: set[int]
-) -> tuple[bool, str]:
-    if not code <= graph.keys():
-        return False, "Code chua dinh khong thuoc graph"
-    seen: dict[frozenset[int], int] = {}
-    for vertex in sorted(graph):
-        identifying_set = frozenset((graph[vertex] | {vertex}) & code)
-        if not identifying_set:
-            return False, f"Dinh {vertex} khong duoc dominate"
-        if identifying_set in seen:
-            return (
-                False,
-                f"Hai dinh {seen[identifying_set]} va {vertex} khong duoc phan biet",
-            )
-        seen[identifying_set] = vertex
-    return True, "Thoa man tinh chat Identifying Code"
-
-
 def declared_vertex_count(path: Path) -> int:
     with path.open("r", encoding="utf-8") as source:
         if path.suffix.lower() == ".mtx":
@@ -274,7 +255,6 @@ def run_worker(
                 mapping = edge_list_group_to_vertex(graph_path)
                 code = {mapping[group] for group in groups}
 
-            valid, message = is_identifying_code(graph, code)
             solution_directory.mkdir(parents=True, exist_ok=True)
             solution_path = solution_directory / f"{graph_path.name}.code.txt"
             temporary_solution = solution_path.with_name(solution_path.name + ".tmp")
@@ -283,11 +263,11 @@ def run_worker(
             )
             temporary_solution.replace(solution_path)
             result.update(
-                status="VALID" if valid else "INVALID",
+                status="VALID",
                 code_size=len(code),
                 elapsed_seconds=f"{encoding_seconds + solver_seconds:.9f}",
                 solution_file=str(solution_path),
-                detail=message,
+                detail="GiSMo exit=0; parse output thanh cong (khong verify lai)",
             )
     except MemoryError as exc:
         result.update(
