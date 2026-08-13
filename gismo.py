@@ -26,7 +26,7 @@ SUPPORTED_SUFFIXES = {".txt", ".mtx", ".edges"}
 # Sua hai duong dan nay tren server, hoac truyen bang command line.
 GISMO_BINARY = Path("/home/ndthuc/bvthach/gismo-experiment/Gismo-experiment/gismo-env/gismo/build/gismo")
 ENCODE_NETWORK_PATH = Path(
-    "/home/ndthuc/bvthach/gismo-experiment/Gismo-experiment/encoding/encode_network.py"
+    "/home/ndthuc/bvthach/gismo-experiment/Gismo-experiment/gismo-env/identifying-codes/scripts/encoding/encode_network.py"
 )
 
 RESULT_FIELDS = [
