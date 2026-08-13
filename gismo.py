@@ -24,9 +24,9 @@ DEFAULT_RAM_LIMIT_GB = 64.0
 SUPPORTED_SUFFIXES = {".txt", ".mtx", ".edges"}
 
 # Sua hai duong dan nay tren server, hoac truyen bang command line.
-GISMO_BINARY = Path("/CHANGE_ME/gismo/build/gismo")
+GISMO_BINARY = Path("/home/ndthuc/bvthach/gismo-experiment/Gismo-experiment/gismo-env/gismo/build/gismo")
 ENCODE_NETWORK_PATH = Path(
-    "/CHANGE_ME/identifying-codes/scripts/encoding/encode_network.py"
+    "/home/ndthuc/bvthach/gismo-experiment/Gismo-experiment/encoding/encode_network.py"
 )
 
 RESULT_FIELDS = [
