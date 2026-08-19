@@ -291,6 +291,7 @@ def run_worker(
     gismo_binary: Path,
     project_directory: Path,
     k: int,
+    validate: bool,
 ) -> int:
     """Dung dung pipeline trong web-gcnf/app/routes.py cho mot graph."""
     start = time.perf_counter()
@@ -379,9 +380,14 @@ def run_worker(
                 mapping = edge_list_group_to_vertex(graph_path)
                 code = {mapping[group] for group in groups}
 
-            evaluation_start = time.perf_counter()
-            valid, evaluation_message = evaluate_output(graph, code, k)
-            evaluation_seconds = time.perf_counter() - evaluation_start
+            if validate:
+                evaluation_start = time.perf_counter()
+                valid, evaluation_message = evaluate_output(graph, code, k)
+                evaluation_seconds = time.perf_counter() - evaluation_start
+            else:
+                valid = True
+                evaluation_message = "Bo qua validate theo --no-validate"
+                evaluation_seconds = 0.0
 
             solution_directory.mkdir(parents=True, exist_ok=True)
             solution_path = solution_directory / f"{graph_path.name}.code.txt"
@@ -429,6 +435,7 @@ def run_isolated(
     timeout_seconds: float,
     ram_limit_bytes: int,
     k: int,
+    validate: bool,
 ) -> dict[str, object]:
     temp_directory = temp_directory_for_k(script_path.parent, k)
     handle = tempfile.NamedTemporaryFile(
@@ -457,6 +464,8 @@ def run_isolated(
         str(ram_limit_bytes),
         "--worker-k",
         str(k),
+        "--worker-validate",
+        "1" if validate else "0",
     ]
     process = subprocess.Popen(
         command,
@@ -600,6 +609,12 @@ def main() -> None:
     parser.add_argument("graphs", nargs="*", type=Path)
     parser.add_argument("--timeout", type=float, default=DEFAULT_TIMEOUT_SECONDS)
     parser.add_argument("--ram-limit-gb", type=float, default=DEFAULT_RAM_LIMIT_GB)
+    parser.add_argument(
+        "--validate",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="kiem tra lai output bang chu ky x_i | y_i (mac dinh: bat)",
+    )
     parser.add_argument("--gismo-binary", type=Path, default=GISMO_BINARY)
     parser.add_argument("--encoder-path", type=Path, default=ENCODE_NETWORK_PATH)
     parser.add_argument("--output-csv", type=Path, default=project_directory / "gismo-results.csv")
@@ -613,6 +628,12 @@ def main() -> None:
     parser.add_argument("--result-file", type=Path, help=argparse.SUPPRESS)
     parser.add_argument("--worker-ram-bytes", type=int, help=argparse.SUPPRESS)
     parser.add_argument("--worker-k", type=int, help=argparse.SUPPRESS)
+    parser.add_argument(
+        "--worker-validate",
+        type=int,
+        choices=(0, 1),
+        help=argparse.SUPPRESS,
+    )
     args = parser.parse_args()
 
     if args.worker is not None:
@@ -620,6 +641,7 @@ def main() -> None:
             args.result_file is None
             or args.worker_ram_bytes is None
             or args.worker_k is None
+            or args.worker_validate is None
         ):
             parser.error("worker thieu tham so")
         set_ram_limit(args.worker_ram_bytes)
@@ -632,6 +654,7 @@ def main() -> None:
                 args.gismo_binary,
                 project_directory,
                 args.worker_k,
+                bool(args.worker_validate),
             )
         )
     if args.timeout <= 0 or args.ram_limit_gb <= 0:
@@ -671,7 +694,8 @@ def main() -> None:
             f"[K {k_index}/{len(K)}] Tim thay {len(graph_paths)} graph; "
             f"da co ket qua={len(graph_paths)-len(pending)}, "
             f"con lai={len(pending)}. k={k}, timeout={args.timeout:g}s, "
-            f"RAM limit={args.ram_limit_gb:g} GiB/graph."
+            f"RAM limit={args.ram_limit_gb:g} GiB/graph, "
+            f"validate={'BAT' if args.validate else 'TAT'}."
         )
         if not pending:
             print(f"Khong co graph nao can chay voi k={k}. Ket qua: {output_csv}")
@@ -687,6 +711,7 @@ def main() -> None:
                 args.timeout,
                 ram_limit_bytes,
                 k,
+                args.validate,
             )
             append_result(output_csv, result)
             print(
