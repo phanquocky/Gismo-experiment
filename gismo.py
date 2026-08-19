@@ -13,9 +13,14 @@ import subprocess
 import sys
 import tempfile
 import time
+from itertools import combinations
 from pathlib import Path
 
 import dataset_standardize
+
+
+Graph = dict[int, set[int]]
+FireState = tuple[int, ...]
 
 
 K = [2]
@@ -50,6 +55,102 @@ def temp_directory_for_k(project_directory: Path, k: int) -> Path:
     temp_directory = project_directory / "temp" / f"k{k}"
     temp_directory.mkdir(parents=True, exist_ok=True)
     return temp_directory
+
+
+def closed_neighborhoods(graph: Graph) -> dict[int, set[int]]:
+    """Tra ve N[v] cho moi dinh va kiem tra nhan dinh ke."""
+    vertices = set(graph)
+    if not vertices:
+        raise ValueError("Graph rong")
+
+    for vertex, neighbors in graph.items():
+        unknown = neighbors - vertices
+        if unknown:
+            raise ValueError(
+                f"Dinh {vertex} co dinh ke khong thuoc graph: {sorted(unknown)}"
+            )
+    return {vertex: set(neighbors) | {vertex} for vertex, neighbors in graph.items()}
+
+
+def fire_states(vertices: list[int], k: int) -> list[FireState]:
+    """Liet ke moi trang thai co tu 1 den k dinh bi chay."""
+    number_of_vertices = len(vertices)
+    if not 1 <= k <= number_of_vertices:
+        raise ValueError(f"k phai nam trong [1, {number_of_vertices}], nhan duoc {k}")
+
+    return [
+        state
+        for number_of_fires in range(1, k + 1)
+        for state in combinations(vertices, number_of_fires)
+    ]
+
+
+def build_or_output_matrix(
+    graph: Graph, sensors: set[int], k: int
+) -> dict[FireState, tuple[tuple[int, ...], tuple[int, ...]]]:
+    """Dung cac hang ``x | y`` bang OR cho moi trang thai chay 1..k dinh.
+
+    Voi trang thai ``F``:
+
+    * ``x_i = 1`` khi sensor ``i`` nam trong F;
+    * ``y_i = 1`` khi sensor ``i`` quan sat duoc it nhat mot dinh trong F.
+
+    Hai cong thuc nay tuong duong lay OR cac hang singleton cua tung dinh
+    dang chay, cho ca thoi diem t0 va t1.
+    """
+    vertices = sorted(graph)
+    neighborhoods = closed_neighborhoods(graph)
+    unknown_sensors = sensors - graph.keys()
+    if unknown_sensors:
+        raise ValueError(f"Sensor khong thuoc graph: {sorted(unknown_sensors)}")
+
+    states = fire_states(vertices, k)
+    ordered_sensors = sorted(sensors)
+    matrix: dict[FireState, tuple[tuple[int, ...], tuple[int, ...]]] = {}
+    for state in states:
+        x_row = tuple(int(sensor in state) for sensor in ordered_sensors)
+        y_row = tuple(
+            int(any(sensor in neighborhoods[vertex] for vertex in state))
+            for sensor in ordered_sensors
+        )
+        matrix[state] = x_row, y_row
+    return matrix
+
+
+def _format_fire_state(state: FireState) -> str:
+    return "{" + ",".join(f"v_{vertex}" for vertex in state) + "}"
+
+
+def evaluate_output(
+    graph: Graph, sensors: set[int], k: int
+) -> tuple[bool, str]:
+    """Kiem tra domination va separation bang chu ky OR ``x | y``."""
+    try:
+        matrix = build_or_output_matrix(graph, sensors, k)
+    except ValueError as exc:
+        return False, str(exc)
+
+    seen: dict[tuple[int, ...], FireState] = {}
+    for state, (x_row, y_row) in matrix.items():
+        if not any(y_row):
+            return (
+                False,
+                f"Trang thai {_format_fire_state(state)} khong duoc dominate",
+            )
+
+        signature = x_row + y_row
+        if signature in seen:
+            return (
+                False,
+                f"Hai trang thai {_format_fire_state(seen[signature])} va "
+                f"{_format_fire_state(state)} khong duoc phan biet",
+            )
+        seen[signature] = state
+
+    return (
+        True,
+        f"Output hop le cho moi trang thai co tu 1 den {k} dinh chay",
+    )
 
 
 def parse_gismo_ind_from_text(text: str) -> list[int]:
@@ -213,6 +314,14 @@ def run_worker(
                 "PROJECT_DIR",
                 str(project_directory / "web-gcnf" / "identifying-codes"),
             )
+            # identifying_codes.py tao TEMP_*_pbs.cnf/.pbo trong os.getcwd().
+            # Dat ca working directory va cac bien temp vao scratch cua graph
+            # de khong phat sinh file trung gian trong repository.
+            environment.update(
+                TMPDIR=str(work_directory),
+                TMP=str(work_directory),
+                TEMP=str(work_directory),
+            )
 
             encoding_start = time.perf_counter()
             encoded = subprocess.run(
@@ -235,6 +344,7 @@ def run_worker(
                 stderr=subprocess.PIPE,
                 text=True,
                 env=environment,
+                cwd=work_directory,
             )
             encoding_seconds = time.perf_counter() - encoding_start
             result["encoding_seconds"] = f"{encoding_seconds:.9f}"
@@ -251,6 +361,8 @@ def run_worker(
                 stdout=subprocess.PIPE,
                 stderr=subprocess.PIPE,
                 text=True,
+                env=environment,
+                cwd=work_directory,
             )
             solver_seconds = time.perf_counter() - solver_start
             result["solver_seconds"] = f"{solver_seconds:.9f}"
@@ -267,6 +379,10 @@ def run_worker(
                 mapping = edge_list_group_to_vertex(graph_path)
                 code = {mapping[group] for group in groups}
 
+            evaluation_start = time.perf_counter()
+            valid, evaluation_message = evaluate_output(graph, code, k)
+            evaluation_seconds = time.perf_counter() - evaluation_start
+
             solution_directory.mkdir(parents=True, exist_ok=True)
             solution_path = solution_directory / f"{graph_path.name}.code.txt"
             temporary_solution = solution_path.with_name(solution_path.name + ".tmp")
@@ -275,11 +391,16 @@ def run_worker(
             )
             temporary_solution.replace(solution_path)
             result.update(
-                status="VALID",
+                status="VALID" if valid else "INVALID",
                 code_size=len(code),
-                elapsed_seconds=f"{encoding_seconds + solver_seconds:.9f}",
+                elapsed_seconds=(
+                    f"{encoding_seconds + solver_seconds + evaluation_seconds:.9f}"
+                ),
                 solution_file=str(solution_path),
-                detail="GiSMo exit=0; parse output thanh cong (khong verify lai)",
+                detail=(
+                    f"GiSMo exit=0; {evaluation_message}; "
+                    f"evaluate={evaluation_seconds:.9f}s"
+                ),
             )
     except MemoryError as exc:
         result.update(
