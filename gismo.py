@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Chay thuc nghiem GiSMo voi k=1 tren standardized_dataset/."""
+"""Chay thuc nghiem GiSMo voi moi k trong K tren standardized_dataset/."""
 
 from __future__ import annotations
 
@@ -18,7 +18,7 @@ from pathlib import Path
 import dataset_standardize
 
 
-K = 1
+K = [2]
 DEFAULT_TIMEOUT_SECONDS = 8 * 60 * 60
 DEFAULT_RAM_LIMIT_GB = 64.0
 SUPPORTED_SUFFIXES = {".txt", ".mtx", ".edges"}
@@ -182,6 +182,7 @@ def run_worker(
     encoder_path: Path,
     gismo_binary: Path,
     project_directory: Path,
+    k: int,
 ) -> int:
     """Dung dung pipeline trong web-gcnf/app/routes.py cho mot graph."""
     start = time.perf_counter()
@@ -194,7 +195,7 @@ def run_worker(
         with tempfile.TemporaryDirectory(prefix=f"gismo-{graph_path.stem}-") as temp:
             work_directory = Path(temp)
             gcnf_name = f"{graph_path.stem}.gcnf"
-            gcnf_path = work_directory / f"k{K}" / gcnf_name
+            gcnf_path = work_directory / f"k{k}" / gcnf_name
 
             environment = os.environ.copy()
             environment.setdefault(
@@ -217,7 +218,7 @@ def run_worker(
                     "gis",
                     "--two_step",
                     "-k",
-                    str(K),
+                    str(k),
                 ],
                 stdout=subprocess.PIPE,
                 stderr=subprocess.PIPE,
@@ -295,6 +296,7 @@ def run_isolated(
     gismo_binary: Path,
     timeout_seconds: float,
     ram_limit_bytes: int,
+    k: int,
 ) -> dict[str, object]:
     handle = tempfile.NamedTemporaryFile(prefix="gismo-result-", suffix=".json", delete=False)
     result_path = Path(handle.name)
@@ -315,6 +317,8 @@ def run_isolated(
         str(gismo_binary),
         "--worker-ram-bytes",
         str(ram_limit_bytes),
+        "--worker-k",
+        str(k),
     ]
     process = subprocess.Popen(
         command,
@@ -444,6 +448,13 @@ def remove_results(csv_path: Path, datasets: set[str]) -> None:
     temporary.replace(csv_path)
 
 
+def result_csv_for_k(base_path: Path, k: int) -> Path:
+    """Tao ten CSV rieng cho moi k de ket qua khong bi tron/ghi de."""
+    suffix = base_path.suffix or ".csv"
+    stem = base_path.stem if base_path.suffix else base_path.name
+    return base_path.with_name(f"{stem}-k{k}{suffix}")
+
+
 def main() -> None:
     script_path = Path(__file__).resolve()
     project_directory = script_path.parent
@@ -463,10 +474,15 @@ def main() -> None:
     parser.add_argument("--worker", type=Path, help=argparse.SUPPRESS)
     parser.add_argument("--result-file", type=Path, help=argparse.SUPPRESS)
     parser.add_argument("--worker-ram-bytes", type=int, help=argparse.SUPPRESS)
+    parser.add_argument("--worker-k", type=int, help=argparse.SUPPRESS)
     args = parser.parse_args()
 
     if args.worker is not None:
-        if args.result_file is None or args.worker_ram_bytes is None:
+        if (
+            args.result_file is None
+            or args.worker_ram_bytes is None
+            or args.worker_k is None
+        ):
             parser.error("worker thieu tham so")
         set_ram_limit(args.worker_ram_bytes)
         raise SystemExit(
@@ -477,6 +493,7 @@ def main() -> None:
                 args.encoder_path,
                 args.gismo_binary,
                 project_directory,
+                args.worker_k,
             )
         )
     if args.timeout <= 0 or args.ram_limit_gb <= 0:
@@ -501,40 +518,48 @@ def main() -> None:
         graph_paths,
         key=lambda path: (declared_vertex_count(path), path.name.lower()),
     )
-    done = completed_datasets(args.output_csv, retry_invalid=args.retry_invalid)
-    pending = [path for path in graph_paths if path.name not in done]
-    if args.retry_invalid:
-        remove_results(args.output_csv, {path.name for path in pending})
-    print(
-        f"Tim thay {len(graph_paths)} graph; da co ket qua={len(graph_paths)-len(pending)}, "
-        f"con lai={len(pending)}. k={K}, timeout={args.timeout:g}s, "
-        f"RAM limit={args.ram_limit_gb:g} GiB/graph."
-    )
-    if not pending:
-        print(f"Khong co graph nao can chay. Ket qua: {args.output_csv}")
-        return
-
     ram_limit_bytes = int(args.ram_limit_gb * 1024**3)
-    for index, graph_path in enumerate(pending, start=1):
-        result = run_isolated(
-            script_path,
-            graph_path.resolve(),
-            args.solution_dir.resolve(),
-            args.encoder_path.resolve(),
-            args.gismo_binary.resolve(),
-            args.timeout,
-            ram_limit_bytes,
+    for k_index, k in enumerate(K, start=1):
+        output_csv = result_csv_for_k(args.output_csv, k)
+        solution_directory = args.solution_dir / f"k{k}"
+        done = completed_datasets(
+            output_csv, retry_invalid=args.retry_invalid
         )
-        append_result(args.output_csv, result)
+        pending = [path for path in graph_paths if path.name not in done]
+        if args.retry_invalid:
+            remove_results(output_csv, {path.name for path in pending})
+
         print(
-            f"[{index:02d}/{len(pending):02d}] {graph_path.name}: "
-            f"STATUS={result['status']} | time={result['elapsed_seconds']}s | "
-            f"code_size={result['code_size'] or 'N/A'}"
+            f"[K {k_index}/{len(K)}] Tim thay {len(graph_paths)} graph; "
+            f"da co ket qua={len(graph_paths)-len(pending)}, "
+            f"con lai={len(pending)}. k={k}, timeout={args.timeout:g}s, "
+            f"RAM limit={args.ram_limit_gb:g} GiB/graph."
         )
-        if result["status"] != "VALID":
-            detail = str(result.get("detail") or "Khong co thong tin loi")
-            print(f"  detail: {detail}")
-    print(f"Da ghi tong ket: {args.output_csv}")
+        if not pending:
+            print(f"Khong co graph nao can chay voi k={k}. Ket qua: {output_csv}")
+            continue
+
+        for index, graph_path in enumerate(pending, start=1):
+            result = run_isolated(
+                script_path,
+                graph_path.resolve(),
+                solution_directory.resolve(),
+                args.encoder_path.resolve(),
+                args.gismo_binary.resolve(),
+                args.timeout,
+                ram_limit_bytes,
+                k,
+            )
+            append_result(output_csv, result)
+            print(
+                f"[k={k} | {index:02d}/{len(pending):02d}] {graph_path.name}: "
+                f"STATUS={result['status']} | time={result['elapsed_seconds']}s | "
+                f"code_size={result['code_size'] or 'N/A'}"
+            )
+            if result["status"] != "VALID":
+                detail = str(result.get("detail") or "Khong co thong tin loi")
+                print(f"  detail: {detail}")
+        print(f"Da ghi tong ket k={k}: {output_csv}")
 
 
 if __name__ == "__main__":
