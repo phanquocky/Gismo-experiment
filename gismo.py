@@ -45,6 +45,13 @@ RESULT_FIELDS = [
 ]
 
 
+def temp_directory_for_k(project_directory: Path, k: int) -> Path:
+    """Tra ve thu muc scratch dung chung ``temp/k<k>/`` va tao neu can."""
+    temp_directory = project_directory / "temp" / f"k{k}"
+    temp_directory.mkdir(parents=True, exist_ok=True)
+    return temp_directory
+
+
 def parse_gismo_ind_from_text(text: str) -> list[int]:
     """Tuong duong web-gcnf/app/utils/parse_gismo_output.py."""
     for raw_line in text.splitlines():
@@ -192,7 +199,11 @@ def run_worker(
         result["vertices"] = len(graph)
         result["edges"] = sum(map(len, graph.values())) // 2
 
-        with tempfile.TemporaryDirectory(prefix=f"gismo-{graph_path.stem}-") as temp:
+        temp_directory = temp_directory_for_k(project_directory, k)
+        with tempfile.TemporaryDirectory(
+            prefix=f"gismo-{graph_path.stem}-",
+            dir=temp_directory,
+        ) as temp:
             work_directory = Path(temp)
             gcnf_name = f"{graph_path.stem}.gcnf"
             gcnf_path = work_directory / f"k{k}" / gcnf_name
@@ -298,7 +309,13 @@ def run_isolated(
     ram_limit_bytes: int,
     k: int,
 ) -> dict[str, object]:
-    handle = tempfile.NamedTemporaryFile(prefix="gismo-result-", suffix=".json", delete=False)
+    temp_directory = temp_directory_for_k(script_path.parent, k)
+    handle = tempfile.NamedTemporaryFile(
+        prefix="gismo-result-",
+        suffix=".json",
+        dir=temp_directory,
+        delete=False,
+    )
     result_path = Path(handle.name)
     handle.close()
     result_path.unlink(missing_ok=True)
