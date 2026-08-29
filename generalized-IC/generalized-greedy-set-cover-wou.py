@@ -23,7 +23,7 @@ from types import ModuleType
 
 
 K = [2]
-ALGORITHM_VERSION = "or-observation-v2"
+ALGORITHM_VERSION = "compressed-or-t0-t1-v3"
 EXPECTED_DATASET_COUNT = 50
 DEFAULT_TIMEOUT_SECONDS = 8 * 60 * 60
 DEFAULT_RAM_LIMIT_GB = 64.0
@@ -57,16 +57,23 @@ def _load_module(path: Path, module_name: str) -> ModuleType:
 
 def load_algorithm() -> ModuleType:
     """Tai phan thuat toan generalized tu file sibling ``-wou-x.py``."""
-    path = Path(__file__).resolve().with_name(
-        "generalized-greedy-set-cover-wou-x.py"
-    )
+    path = Path(__file__).resolve().with_name("generalized-greedy-set-cover-wou-x.py")
     return _load_module(path, "generalized_greedy_set_cover_wou_x")
 
 
 def load_batch_support() -> ModuleType:
     """Tai parser graph va cac helper resource tu greedy-set-cover.py."""
-    path = Path(__file__).resolve().with_name("greedy-set-cover.py")
-    return _load_module(path, "greedy_set_cover_batch_support")
+    script_directory = Path(__file__).resolve().parent
+    candidates = (
+        script_directory / "greedy-set-cover.py",
+        script_directory.parent / "set-cover" / "greedy-set-cover.py",
+    )
+    for path in candidates:
+        if path.is_file():
+            return _load_module(path, "greedy_set_cover_batch_support")
+    raise ImportError(
+        "Khong tim thay greedy-set-cover.py tai: " + ", ".join(map(str, candidates))
+    )
 
 
 def result_template(graph_path: Path) -> dict[str, object]:
@@ -116,9 +123,7 @@ def run_worker(
         ) = algorithm.expanded_graph_statistics(graph, k)
 
         algorithm_start = time.perf_counter()
-        code = algorithm.generalized_id_greedy_without_universe_with_t0(
-            graph, k
-        )
+        code = algorithm.generalized_id_greedy_without_universe_with_t0(graph, k)
         algorithm_elapsed = time.perf_counter() - algorithm_start
         valid, message = algorithm.evaluate_output(graph, code, k)
 
@@ -478,9 +483,7 @@ def main() -> None:
         solution_directory = args.solution_dir / ALGORITHM_VERSION / f"k{k}"
         try:
             ensure_result_schema(output_csv)
-            done = completed_datasets(
-                output_csv, retry_invalid=args.retry_invalid
-            )
+            done = completed_datasets(output_csv, retry_invalid=args.retry_invalid)
         except (OSError, ValueError, csv.Error) as exc:
             parser.error(f"Khong the doc CSV ket qua cu: {exc}")
 
