@@ -24,7 +24,7 @@ from pathlib import Path
 
 
 Graph = dict[int, set[int]]
-E_VALUES = (2,)
+E_VALUES = (3,)
 DEFAULT_TIMEOUT_SECONDS = 8 * 60 * 60
 DEFAULT_RAM_LIMIT_GB = 64.0
 SUPPORTED_SUFFIXES = {".txt", ".mtx", ".edges"}
