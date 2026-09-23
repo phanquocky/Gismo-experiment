@@ -11,6 +11,9 @@ chung chua day du L-sensors, neu khong bi timeout/RAM limit.
 code_size dem so goi/vi tri da chon; total_selected_types = 2 * code_size.
 Gain cua goi duoc tinh chung sau khi them ca hai bit, khong cong hai gain
 rieng le vi cac constraints ma hai loai sensor giai quyet co the trung nhau.
+Moi vong tinh gain theo batch: dung chung local-count theo partition group,
+cache cac N[v] co cung residual profile, va chi refine goi thang cuoc.
+Lazy heap chi tinh lai cac ung vien co upper bound du lon de canh tranh.
 Sau greedy, reverse-delete loai cac goi du thua trong thu tu nguoc.
 """
 
@@ -18,11 +21,12 @@ from __future__ import annotations
 
 import argparse
 import csv
+import heapq
 import importlib.util
 import math
 import time
 from collections import defaultdict
-from collections.abc import Iterable, Mapping, Sequence
+from collections.abc import Callable, Iterable, Mapping, Sequence
 from pathlib import Path
 from types import ModuleType
 
@@ -31,7 +35,7 @@ Graph = dict[int, set[int]]
 SensorID = tuple[str, int]
 Group = tuple[int, set[int]]
 K = 2
-ALGORITHM_VERSION = "partition-bundled-two-sensor-types-k2-pruned-v2"
+ALGORITHM_VERSION = "partition-bundled-two-sensor-types-k2-pruned-batched-lazy-v3"
 EXPECTED_DATASET_COUNT = 50
 DEFAULT_TIMEOUT_SECONDS = 8 * 60 * 60
 DEFAULT_RAM_LIMIT_GB = 64.0
@@ -151,23 +155,81 @@ def refine(groups: Sequence[Group], detection: set[int], bit: int) -> list[Group
     return refined
 
 
-def bundled_candidate(
+def containing_state_counts_by_group(groups: Sequence[Group]) -> list[dict[int, int]]:
+    """Dem states chua v; ket qua giong nhau cho moi v trong cung group."""
+    signatures = [signature for signature, _ in groups]
+    sizes = [len(vertices) for _, vertices in groups]
+    state_count = sum(sizes)
+    out: list[dict[int, int]] = []
+    for i, signature in enumerate(signatures):
+        counts: defaultdict[int, int] = defaultdict(int)
+        counts[signature] += 1  # singleton {v}
+        for j, other_signature in enumerate(signatures):
+            pair_count = sizes[j] - (i == j)
+            if pair_count:
+                counts[signature | other_signature] += pair_count
+        if sum(counts.values()) != state_count:
+            raise RuntimeError("Dem sai so singleton/pair states chua mot dinh")
+        out.append(dict(counts))
+    return out
+
+
+def prepare_bundled_gain_evaluator(
     groups: Sequence[Group],
-    neighborhood_detection: set[int],
-    local_detection: set[int],
-    first_bit: int,
-) -> tuple[list[Group], int]:
-    """Them hai signal, dung gain tuan tu de tranh aggregate tren 3p nhom."""
-    after_local = refine(groups, local_detection, first_bit)
-    local_counts = aggregate(
-        after_local, [len(vertices) for _, vertices in after_local]
-    )
-    after_local_residual = remaining(local_counts)
-    neighborhood_gain = candidate_gain(
-        after_local, local_counts, neighborhood_detection
-    )
-    after_both = refine(after_local, neighborhood_detection, first_bit << 1)
-    return after_both, after_local_residual - neighborhood_gain
+    counts: Mapping[int, int],
+    neighborhoods: Mapping[int, set[int]],
+) -> Callable[[int], int]:
+    """Chuan bi state chung va tra evaluator co cache cho mot vong greedy."""
+    group_sizes = [len(vertices) for _, vertices in groups]
+    group_of: dict[int, int] = {}
+    for group_index, (_, group_vertices) in enumerate(groups):
+        for vertex in group_vertices:
+            group_of[vertex] = group_index
+    if len(group_of) != sum(group_sizes):
+        raise RuntimeError("Partition groups bi trung dinh")
+
+    containing_by_group = containing_state_counts_by_group(groups)
+    profile_cache: dict[tuple[int, ...], tuple[int, dict[int, int]]] = {}
+
+    def evaluate(vertex: int) -> int:
+        residual = group_sizes.copy()
+        for detected_vertex in neighborhoods[vertex]:
+            residual[group_of[detected_vertex]] -= 1
+        profile = tuple(residual)
+
+        cached = profile_cache.get(profile)
+        if cached is None:
+            zeros = aggregate(groups, profile)
+            neighbor_gain = counts.get(0, 0) - zeros.get(0, 0)
+            for signature, count in counts.items():
+                zero_count = zeros.get(signature, 0)
+                neighbor_gain += (count - zero_count) * zero_count
+            cached = neighbor_gain, zeros
+            profile_cache[profile] = cached
+        neighbor_gain, zeros = cached
+
+        local_gain = 0
+        for signature, containing_count in containing_by_group[
+            group_of[vertex]
+        ].items():
+            neighborhood_hit_count = counts[signature] - zeros.get(signature, 0)
+            if containing_count > neighborhood_hit_count:
+                raise RuntimeError("State chua v phai duoc N[v] phat hien")
+            local_gain += containing_count * (neighborhood_hit_count - containing_count)
+        return neighbor_gain + local_gain
+
+    return evaluate
+
+
+def all_bundled_gains(
+    groups: Sequence[Group],
+    counts: Mapping[int, int],
+    neighborhoods: Mapping[int, set[int]],
+    available: set[int],
+) -> dict[int, int]:
+    """Tinh gain moi goi trong mot batch; helper dung cho test/debug."""
+    evaluate = prepare_bundled_gain_evaluator(groups, counts, neighborhoods)
+    return {vertex: evaluate(vertex) for vertex in sorted(available)}
 
 
 def greedy_k2_bundled(
@@ -184,6 +246,8 @@ def greedy_k2_bundled(
     history: list[tuple[int, int, int, int]] = []
     total_states = len(vertices) + choose2(len(vertices))
     counts = aggregate(groups, [len(group_vertices) for _, group_vertices in groups])
+    gain_heap: list[tuple[int, int, int]] = []
+    iteration = 0
 
     while True:
         if sum(counts.values()) != total_states:
@@ -192,45 +256,50 @@ def greedy_k2_bundled(
         if before == 0:
             return selected, history
 
-        best_vertex: int | None = None
-        best_gain = 0
-        best_after = before
-        best_groups: list[Group] | None = None
-        first_bit = 1 << (2 * len(selected))
-        for vertex in vertices:
+        evaluate = prepare_bundled_gain_evaluator(groups, counts, neighborhoods)
+        if iteration == 0:
+            for vertex in vertices:
+                heapq.heappush(gain_heap, (-evaluate(vertex), vertex, iteration))
+
+        while gain_heap:
+            negative_bound, vertex, evaluated_iteration = heapq.heappop(gain_heap)
             if vertex not in available:
                 continue
-            candidate_groups, after = bundled_candidate(
-                groups,
-                neighborhoods[vertex],
-                {vertex},
-                first_bit,
-            )
-            gain = before - after
-            if gain > best_gain:
+            bound = -negative_bound
+            if evaluated_iteration == iteration:
                 best_vertex = vertex
-                best_gain = gain
-                best_after = after
-                best_groups = candidate_groups
+                best_gain = bound
+                break
+            exact_gain = evaluate(vertex)
+            if exact_gain > bound:
+                raise RuntimeError(
+                    "Marginal gain tang; vi pham bat bien lazy Set Cover"
+                )
+            heapq.heappush(gain_heap, (-exact_gain, vertex, iteration))
+        else:
+            raise RuntimeError("Het goi ung vien khi van con constraint")
 
-        if best_vertex is None or best_groups is None or best_gain <= 0:
+        if best_gain <= 0:
             raise RuntimeError(
                 "Khong co positive bundled gain; implementation hoac input sai"
             )
         available.remove(best_vertex)
         selected.append(best_vertex)
-        groups = best_groups
+        first_bit = 1 << (2 * (len(selected) - 1))
+        groups = refine(groups, {best_vertex}, first_bit)
+        groups = refine(groups, neighborhoods[best_vertex], first_bit << 1)
         counts = aggregate(
             groups, [len(group_vertices) for _, group_vertices in groups]
         )
         actual_after = remaining(counts)
-        if actual_after != best_after or actual_after != before - best_gain:
+        if actual_after != before - best_gain:
             raise RuntimeError(
                 f"Gain invariant sai: before={before}, gain={best_gain}, "
-                f"predicted_after={best_after}, actual_after={actual_after}"
+                f"actual_after={actual_after}"
             )
         if trace:
             history.append((best_vertex, best_gain, before, actual_after))
+        iteration += 1
 
 
 def greedy_k2(
@@ -505,7 +574,7 @@ def main() -> None:
         "--output-csv",
         type=Path,
         default=script_path.with_name(
-            "greedy_k2_partition_bundled_two_sensor_types-results.csv"
+            "greedy_k2_partition_bundled_two_sensor_types-lazy-results.csv"
         ),
     )
     parser.add_argument(
@@ -513,7 +582,7 @@ def main() -> None:
         type=Path,
         default=(
             script_path.parent
-            / "greedy_k2_partition_bundled_two_sensor_types-solutions"
+            / "greedy_k2_partition_bundled_two_sensor_types-lazy-solutions"
         ),
     )
     parser.add_argument("--worker", type=Path, help=argparse.SUPPRESS)
