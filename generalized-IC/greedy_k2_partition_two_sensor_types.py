@@ -3,13 +3,15 @@
 
 Mac dinh chay 50 graph trong standardized_dataset/ theo so dinh tang dan.
 Moi graph chay trong worker rieng, timeout 8 gio, RAM 64 GiB va resume tu
-CSV. Hai loai N (closed-neighborhood) va L (single-vertex) deu tham gia
-greedy ngay tu dau. Day du L-sensors dam bao luon co nghiem neu khong bi
-timeout/RAM limit.
+CSV. Moi ung vien greedy la mot dinh v: khi chon v, ca N-sensor
+(closed-neighborhood) va L-sensor (single-vertex) tai v duoc them cung luc.
+Moi goi nhu vay co chi phi 1 vi tri. Chon tat ca cac goi luon cho nghiem vi
+chung chua day du L-sensors, neu khong bi timeout/RAM limit.
 
-Greedy chon cac ung vien (type, vertex) rieng biet nhu dac ta. Tuy nhien
-code_size dem so vi tri dinh vat ly: N va L cung tren mot dinh chi tinh 1.
-total_selected_types ghi so ung vien/loai thuc te da chon de khong nham lan.
+code_size dem so goi/vi tri da chon; total_selected_types = 2 * code_size.
+Gain cua goi duoc tinh chung sau khi them ca hai bit, khong cong hai gain
+rieng le vi cac constraints ma hai loai sensor giai quyet co the trung nhau.
+Sau greedy, reverse-delete loai cac goi du thua trong thu tu nguoc.
 """
 
 from __future__ import annotations
@@ -29,7 +31,7 @@ Graph = dict[int, set[int]]
 SensorID = tuple[str, int]
 Group = tuple[int, set[int]]
 K = 2
-ALGORITHM_VERSION = "partition-two-sensor-types-k2-unique-position-metric-v1"
+ALGORITHM_VERSION = "partition-bundled-two-sensor-types-k2-pruned-v2"
 EXPECTED_DATASET_COUNT = 50
 DEFAULT_TIMEOUT_SECONDS = 8 * 60 * 60
 DEFAULT_RAM_LIMIT_GB = 64.0
@@ -43,10 +45,12 @@ RESULT_FIELDS = [
     "edges",
     "fire_states",
     "candidate_type_count",
+    "candidate_bundle_count",
     "total_selected_types",
     "n_sensor_count",
     "l_sensor_count",
     "dual_type_vertex_count",
+    "pre_prune_code_size",
     "code_size",
     "remaining_constraints",
     "max_signature_multiplicity",
@@ -145,6 +149,88 @@ def refine(groups: Sequence[Group], detection: set[int], bit: int) -> list[Group
         if hit:
             refined.append((signature | bit, hit))
     return refined
+
+
+def bundled_candidate(
+    groups: Sequence[Group],
+    neighborhood_detection: set[int],
+    local_detection: set[int],
+    first_bit: int,
+) -> tuple[list[Group], int]:
+    """Them hai signal, dung gain tuan tu de tranh aggregate tren 3p nhom."""
+    after_local = refine(groups, local_detection, first_bit)
+    local_counts = aggregate(
+        after_local, [len(vertices) for _, vertices in after_local]
+    )
+    after_local_residual = remaining(local_counts)
+    neighborhood_gain = candidate_gain(
+        after_local, local_counts, neighborhood_detection
+    )
+    after_both = refine(after_local, neighborhood_detection, first_bit << 1)
+    return after_both, after_local_residual - neighborhood_gain
+
+
+def greedy_k2_bundled(
+    graph: Graph,
+    *,
+    trace: bool = False,
+) -> tuple[list[int], list[tuple[int, int, int, int]]]:
+    """Greedy tren n goi vi tri, moi goi them ca N(v) va L(v), chi phi 1."""
+    neighborhoods = closed_neighborhoods(graph)
+    vertices = sorted(graph)
+    available = set(vertices)
+    groups: list[Group] = [(0, set(vertices))] if vertices else []
+    selected: list[int] = []
+    history: list[tuple[int, int, int, int]] = []
+    total_states = len(vertices) + choose2(len(vertices))
+    counts = aggregate(groups, [len(group_vertices) for _, group_vertices in groups])
+
+    while True:
+        if sum(counts.values()) != total_states:
+            raise RuntimeError("Tong state counts khong bang n + C(n,2)")
+        before = remaining(counts)
+        if before == 0:
+            return selected, history
+
+        best_vertex: int | None = None
+        best_gain = 0
+        best_after = before
+        best_groups: list[Group] | None = None
+        first_bit = 1 << (2 * len(selected))
+        for vertex in vertices:
+            if vertex not in available:
+                continue
+            candidate_groups, after = bundled_candidate(
+                groups,
+                neighborhoods[vertex],
+                {vertex},
+                first_bit,
+            )
+            gain = before - after
+            if gain > best_gain:
+                best_vertex = vertex
+                best_gain = gain
+                best_after = after
+                best_groups = candidate_groups
+
+        if best_vertex is None or best_groups is None or best_gain <= 0:
+            raise RuntimeError(
+                "Khong co positive bundled gain; implementation hoac input sai"
+            )
+        available.remove(best_vertex)
+        selected.append(best_vertex)
+        groups = best_groups
+        counts = aggregate(
+            groups, [len(group_vertices) for _, group_vertices in groups]
+        )
+        actual_after = remaining(counts)
+        if actual_after != best_after or actual_after != before - best_gain:
+            raise RuntimeError(
+                f"Gain invariant sai: before={before}, gain={best_gain}, "
+                f"predicted_after={best_after}, actual_after={actual_after}"
+            )
+        if trace:
+            history.append((best_vertex, best_gain, before, actual_after))
 
 
 def greedy_k2(
@@ -247,25 +333,40 @@ def physical_vertices(selected: Iterable[SensorID]) -> set[int]:
     return {vertex for _, vertex in selected}
 
 
+def bundled_sensors(vertices: Iterable[int]) -> list[SensorID]:
+    return [(kind, vertex) for vertex in vertices for kind in ("N", "L")]
+
+
+def prune_bundled_vertices(graph: Graph, selected_vertices: Sequence[int]) -> list[int]:
+    """Reverse-delete cac goi du thua; moi phep xoa deu duoc validate doc lap."""
+    kept = list(selected_vertices)
+    for vertex in reversed(selected_vertices):
+        trial = [kept_vertex for kept_vertex in kept if kept_vertex != vertex]
+        if validate_solution(graph, bundled_sensors(trial))[0]:
+            kept = trial
+    return kept
+
+
 def solve_two_sensor_types(graph: Graph, *, trace: bool = False) -> dict[str, object]:
-    candidates = build_candidates(graph)
-    # Day du singleton sensors la bat bien bao dam nghiem.
-    for vertex in graph:
-        if candidates.get(("L", vertex)) != {vertex}:
-            raise RuntimeError(f"Thieu L-sensor tai dinh {vertex}")
-    selected, history = greedy_k2(graph, candidates, trace=trace)
-    locations = physical_vertices(selected)
-    n_vertices = {v for kind, v in selected if kind == "N"}
-    l_vertices = {v for kind, v in selected if kind == "L"}
+    greedy_selected_vertices, history = greedy_k2_bundled(graph, trace=trace)
+    selected_vertices = prune_bundled_vertices(graph, greedy_selected_vertices)
+    selected = bundled_sensors(selected_vertices)
+    locations = set(selected_vertices)
     return {
         "selected": selected,
+        "selected_vertices": selected_vertices,
+        "greedy_selected_vertices": greedy_selected_vertices,
+        "removed_vertices": [
+            vertex for vertex in greedy_selected_vertices if vertex not in locations
+        ],
         "trace": history,
         "code_vertices": locations,
+        "pre_prune_code_size": len(greedy_selected_vertices),
         "code_size": len(locations),
         "total_selected_types": len(selected),
-        "n_sensor_count": len(n_vertices),
-        "l_sensor_count": len(l_vertices),
-        "dual_type_vertex_count": len(n_vertices & l_vertices),
+        "n_sensor_count": len(locations),
+        "l_sensor_count": len(locations),
+        "dual_type_vertex_count": len(locations),
     }
 
 
@@ -297,6 +398,7 @@ def run_worker(
             edges=sum(map(len, graph.values())) // 2,
             fire_states=n + choose2(n),
             candidate_type_count=2 * n,
+            candidate_bundle_count=n,
         )
         algorithm_start = time.perf_counter()
         solution = solve_two_sensor_types(graph)
@@ -314,6 +416,7 @@ def run_worker(
             n_sensor_count=solution["n_sensor_count"],
             l_sensor_count=solution["l_sensor_count"],
             dual_type_vertex_count=solution["dual_type_vertex_count"],
+            pre_prune_code_size=solution["pre_prune_code_size"],
             remaining_constraints=unresolved,
             max_signature_multiplicity=maximum,
             validation_passed=valid,
@@ -322,7 +425,9 @@ def run_worker(
         )
         if valid:
             solution_directory.mkdir(parents=True, exist_ok=True)
-            sensor_path = solution_directory / f"{graph_path.name}.K2.sensor-types.txt"
+            sensor_path = (
+                solution_directory / f"{graph_path.name}.K2.bundled.sensor-types.txt"
+            )
             sensor_tmp = sensor_path.with_name(sensor_path.name + ".tmp")
             sensor_tmp.write_text(
                 "".join(f"{kind}\t{vertex}\n" for kind, vertex in selected),
@@ -330,7 +435,9 @@ def run_worker(
             )
             sensor_tmp.replace(sensor_path)
 
-            vertex_path = solution_directory / f"{graph_path.name}.K2.vertices.txt"
+            vertex_path = (
+                solution_directory / f"{graph_path.name}.K2.bundled.vertices.txt"
+            )
             vertex_tmp = vertex_path.with_name(vertex_path.name + ".tmp")
             vertex_tmp.write_text(
                 "".join(f"{vertex}\n" for vertex in sorted(solution["code_vertices"])),
@@ -398,13 +505,16 @@ def main() -> None:
         "--output-csv",
         type=Path,
         default=script_path.with_name(
-            "greedy_k2_partition_two_sensor_types-results.csv"
+            "greedy_k2_partition_bundled_two_sensor_types-results.csv"
         ),
     )
     parser.add_argument(
         "--solution-dir",
         type=Path,
-        default=script_path.parent / "greedy_k2_partition_two_sensor_types-solutions",
+        default=(
+            script_path.parent
+            / "greedy_k2_partition_bundled_two_sensor_types-solutions"
+        ),
     )
     parser.add_argument("--worker", type=Path, help=argparse.SUPPRESS)
     parser.add_argument("--result-file", type=Path, help=argparse.SUPPRESS)
