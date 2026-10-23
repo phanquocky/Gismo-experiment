@@ -371,7 +371,7 @@ def run_worker(
     start = time.perf_counter()
     result: dict[str, object] = {
         "dataset": graph_path.name,
-        "status": "INVALID",
+        "status": "ERROR",
         "vertices": "",
         "edges": "",
         "code_size": "",
@@ -427,10 +427,11 @@ def run_worker(
             detail=str(exc) or "Vuot gioi han RAM",
         )
     except Exception as exc:
-        # A standardized graph should have a solution. Failure to produce one is
-        # therefore an invalid algorithm result for this experiment.
+        # INVALID is reserved for a completed solution that fails verification.
+        # An exception means the experiment itself failed, not that the graph or
+        # the returned code was mathematically invalid.
         result.update(
-            status="INVALID",
+            status="ERROR",
             elapsed_seconds=f"{time.perf_counter() - start:.9f}",
             detail=f"{type(exc).__name__}: {exc}",
         )
@@ -552,6 +553,15 @@ def run_dataset_process(
                     -signal.SIGSEGV,
                 }:
                     result["status"] = "RAM_LIMITED"
+                elif process.returncode < 0:
+                    try:
+                        signal_name = signal.Signals(-process.returncode).name
+                    except ValueError:
+                        signal_name = f"signal {-process.returncode}"
+                    result["status"] = "ERROR"
+                    worker_error = (
+                        f"worker bi dung boi {signal_name} ({process.returncode})"
+                    )
                 if worker_error:
                     old_detail = str(result.get("detail") or "")
                     result["detail"] = f"{old_detail} | {worker_error}".strip(" |")
@@ -562,11 +572,20 @@ def run_dataset_process(
             -signal.SIGABRT,
             -signal.SIGSEGV,
         }
+        if process.returncode is not None and process.returncode < 0:
+            signal_number = -process.returncode
+            try:
+                signal_name = signal.Signals(signal_number).name
+            except ValueError:
+                signal_name = f"signal {signal_number}"
+            detail = f"worker bi dung boi {signal_name} ({process.returncode})"
+            if stderr.strip():
+                detail += f": {stderr.strip()[-1000:]}"
         return {
             "dataset": graph_path.name,
             # Native allocators may be killed/abort before Python can catch a
             # MemoryError and write its result JSON.
-            "status": "RAM_LIMITED" if killed_for_memory else "INVALID",
+            "status": "RAM_LIMITED" if killed_for_memory else "ERROR",
             "vertices": "",
             "edges": "",
             "code_size": "",
@@ -592,8 +611,11 @@ RESULT_FIELDS = [
 ]
 
 
-def completed_datasets(csv_path: Path) -> set[str]:
+def completed_datasets(
+    csv_path: Path, rerun_statuses: set[str] | None = None
+) -> set[str]:
     """Lay cac dataset da co mot dong ket qua hoan chinh de resume batch."""
+    rerun_statuses = rerun_statuses or set()
     if not csv_path.exists() or csv_path.stat().st_size == 0:
         return set()
     with csv_path.open("r", encoding="utf-8", newline="") as source:
@@ -607,6 +629,7 @@ def completed_datasets(csv_path: Path) -> set[str]:
             for row in reader
             if (row.get("dataset") or "").strip()
             and (row.get("status") or "").strip()
+            and (row.get("status") or "").strip().upper() not in rerun_statuses
         }
 
 
@@ -619,6 +642,44 @@ def append_csv_result(csv_path: Path, result: dict[str, object]) -> None:
             writer.writeheader()
         writer.writerow({field: result.get(field, "") for field in RESULT_FIELDS})
         output.flush()
+
+
+def upsert_csv_result(csv_path: Path, result: dict[str, object]) -> None:
+    """Thay dong cu cua dataset, hoac append neu dataset chua co trong CSV."""
+    if not csv_path.exists() or csv_path.stat().st_size == 0:
+        append_csv_result(csv_path, result)
+        return
+
+    with csv_path.open("r", encoding="utf-8", newline="") as source:
+        reader = csv.DictReader(source)
+        if reader.fieldnames is None or not set(RESULT_FIELDS) <= set(reader.fieldnames):
+            raise ValueError(f"CSV {csv_path} khong dung schema ket qua")
+        rows = list(reader)
+
+    dataset = str(result.get("dataset") or "")
+    replacement = {field: result.get(field, "") for field in RESULT_FIELDS}
+    new_rows: list[dict[str, object]] = []
+    replaced = False
+    for row in rows:
+        if (row.get("dataset") or "").strip() == dataset:
+            if not replaced:
+                new_rows.append(replacement)
+                replaced = True
+        else:
+            new_rows.append(row)
+    if not replaced:
+        new_rows.append(replacement)
+
+    temporary = csv_path.with_name(csv_path.name + ".tmp")
+    with temporary.open("w", encoding="utf-8", newline="") as output:
+        writer = csv.DictWriter(output, fieldnames=RESULT_FIELDS)
+        writer.writeheader()
+        writer.writerows(
+            {field: row.get(field, "") for field in RESULT_FIELDS} for row in new_rows
+        )
+        output.flush()
+        os.fsync(output.fileno())
+    temporary.replace(csv_path)
 
 
 def main() -> None:
@@ -640,6 +701,16 @@ def main() -> None:
         "--solution-dir",
         type=Path,
         default=script_path.parent / "greedy-set-cover-solutions",
+    )
+    parser.add_argument(
+        "--rerun-status",
+        action="append",
+        default=[],
+        metavar="STATUS",
+        help=(
+            "chay lai va thay the cac dong co status nay trong CSV; "
+            "co the lap option, vi du --rerun-status INVALID"
+        ),
     )
     parser.add_argument("--worker", type=Path, help=argparse.SUPPRESS)
     parser.add_argument("--result-file", type=Path, help=argparse.SUPPRESS)
@@ -682,7 +753,12 @@ def main() -> None:
 
     ram_limit_bytes = int(args.ram_limit_gb * 1024**3)
     try:
-        already_completed = completed_datasets(args.output_csv)
+        rerun_statuses = {
+            status.strip().upper()
+            for status in args.rerun_status
+            if status.strip()
+        }
+        already_completed = completed_datasets(args.output_csv, rerun_statuses)
     except (OSError, ValueError, csv.Error) as exc:
         parser.error(f"Khong the doc CSV ket qua cu: {exc}")
     pending_graphs = [
@@ -705,7 +781,7 @@ def main() -> None:
             args.timeout,
             ram_limit_bytes,
         )
-        append_csv_result(args.output_csv, result)
+        upsert_csv_result(args.output_csv, result)
         print(
             f"[{index:02d}/{len(pending_graphs):02d}] {graph_path.name}: "
             f"STATUS={result['status']} | time={result['elapsed_seconds']}s | "
