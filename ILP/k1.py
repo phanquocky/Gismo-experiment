@@ -4,7 +4,7 @@
 By default, every graph in ``standardized_dataset/`` is processed in
 nondecreasing order of its declared number of vertices.  Each graph runs in
 an isolated worker with an eight-hour wall-clock limit and a 64-GiB RAM
-limit.  Completed runs are appended to a resumable CSV file and every
+limit.  Completed runs are written to a resumable CSV file and every
 optimal code is stored in a separate text file.
 
 The ILP is the standard set-cover formulation.  A binary variable ``x_c``
@@ -651,8 +651,11 @@ RESULT_FIELDS = [
 ]
 
 
-def completed_datasets(csv_path: Path) -> set[str]:
-    """Return datasets having a complete row, for resumable batch runs."""
+def completed_datasets(
+    csv_path: Path, rerun_statuses: set[str] | None = None
+) -> set[str]:
+    """Return datasets that should be skipped by a resumable batch run."""
+    rerun_statuses = {status.upper() for status in (rerun_statuses or set())}
     if not csv_path.exists() or csv_path.stat().st_size == 0:
         return set()
     with csv_path.open("r", encoding="utf-8", newline="") as source:
@@ -661,10 +664,16 @@ def completed_datasets(csv_path: Path) -> set[str]:
             reader.fieldnames
         ):
             raise ValueError(f"CSV {csv_path} thieu cot bat buoc dataset/status")
+        latest_status: dict[str, str] = {}
+        for row in reader:
+            dataset = (row.get("dataset") or "").strip()
+            status = (row.get("status") or "").strip().upper()
+            if dataset and status:
+                latest_status[dataset] = status
         return {
-            (row.get("dataset") or "").strip()
-            for row in reader
-            if (row.get("dataset") or "").strip() and (row.get("status") or "").strip()
+            dataset
+            for dataset, status in latest_status.items()
+            if status not in rerun_statuses
         }
 
 
@@ -677,6 +686,45 @@ def append_csv_result(csv_path: Path, result: Mapping[str, object]) -> None:
             writer.writeheader()
         writer.writerow({field: result.get(field, "") for field in RESULT_FIELDS})
         output.flush()
+
+
+def upsert_csv_result(csv_path: Path, result: Mapping[str, object]) -> None:
+    """Atomically replace a dataset row, or append it when it is new."""
+    if not csv_path.exists() or csv_path.stat().st_size == 0:
+        append_csv_result(csv_path, result)
+        return
+
+    with csv_path.open("r", encoding="utf-8", newline="") as source:
+        reader = csv.DictReader(source)
+        if reader.fieldnames is None or not set(RESULT_FIELDS) <= set(reader.fieldnames):
+            raise ValueError(f"CSV {csv_path} khong dung schema ket qua")
+        rows = list(reader)
+
+    dataset = str(result.get("dataset") or "").strip()
+    replacement = {field: result.get(field, "") for field in RESULT_FIELDS}
+    new_rows: list[Mapping[str, object]] = []
+    replaced = False
+    for row in rows:
+        if (row.get("dataset") or "").strip() == dataset:
+            if not replaced:
+                new_rows.append(replacement)
+                replaced = True
+        else:
+            new_rows.append(row)
+    if not replaced:
+        new_rows.append(replacement)
+
+    temporary = csv_path.with_name(csv_path.name + ".tmp")
+    with temporary.open("w", encoding="utf-8", newline="") as output:
+        writer = csv.DictWriter(output, fieldnames=RESULT_FIELDS)
+        writer.writeheader()
+        writer.writerows(
+            {field: row.get(field, "") for field in RESULT_FIELDS}
+            for row in new_rows
+        )
+        output.flush()
+        os.fsync(output.fileno())
+    temporary.replace(csv_path)
 
 
 def _resolve_cplex_path(path: str | None) -> str:
@@ -713,6 +761,16 @@ def main() -> None:
         "--solution-dir",
         type=Path,
         default=script_path.parent / "k1-solutions",
+    )
+    parser.add_argument(
+        "--rerun-status",
+        action="append",
+        default=[],
+        metavar="STATUS",
+        help=(
+            "chi chay lai va thay the cac dong co status nay trong CSV; "
+            "co the lap option, vi du --rerun-status INVALID"
+        ),
     )
     parser.add_argument("--worker", type=Path, help=argparse.SUPPRESS)
     parser.add_argument("--result-file", type=Path, help=argparse.SUPPRESS)
@@ -774,17 +832,37 @@ def main() -> None:
 
     ram_limit_bytes = int(args.ram_limit_gb * 1024**3)
     try:
-        already_completed = completed_datasets(args.output_csv)
+        rerun_statuses = {
+            status.strip().upper()
+            for status in args.rerun_status
+            if status.strip()
+        }
+        recorded_datasets = completed_datasets(args.output_csv)
+        already_completed = completed_datasets(args.output_csv, rerun_statuses)
     except (OSError, ValueError, csv.Error) as exc:
         parser.error(f"Khong the doc CSV ket qua cu: {exc}")
-    pending_graphs = [
-        path for path in graph_paths if path.name not in already_completed
-    ]
+    if rerun_statuses:
+        pending_graphs = [
+            path
+            for path in graph_paths
+            if path.name in recorded_datasets and path.name not in already_completed
+        ]
+    else:
+        pending_graphs = [
+            path for path in graph_paths if path.name not in already_completed
+        ]
+    selection_summary = (
+        f"chon chay lai={len(pending_graphs)} case co status "
+        f"{','.join(sorted(rerun_statuses))}"
+        if rerun_statuses
+        else (
+            f"da co ket qua={len(graph_paths) - len(pending_graphs)}, "
+            f"con lai={len(pending_graphs)}"
+        )
+    )
     print(
-        f"Tim thay {len(graph_paths)} graph; "
-        f"da co ket qua={len(graph_paths) - len(pending_graphs)}, "
-        f"con lai={len(pending_graphs)}. Timeout={args.timeout:g}s, "
-        f"RAM limit={args.ram_limit_gb:g} GiB/graph. "
+        f"Tim thay {len(graph_paths)} graph; {selection_summary}. "
+        f"Timeout={args.timeout:g}s, RAM limit={args.ram_limit_gb:g} GiB/graph. "
         "Solver=CPLEX_CMD. Thu tu: so dinh tang dan.",
         flush=True,
     )
@@ -801,7 +879,7 @@ def main() -> None:
             ram_limit_bytes,
             cplex_path,
         )
-        append_csv_result(args.output_csv, result)
+        upsert_csv_result(args.output_csv, result)
         print(
             f"[{index:02d}/{len(pending_graphs):02d}] {graph_path.name}: "
             f"STATUS={result['status']} | time={result['elapsed_seconds']}s | "

@@ -838,8 +838,11 @@ RESULT_FIELDS = [
 ]
 
 
-def completed_runs(csv_path: Path) -> set[tuple[str, int]]:
-    """Return completed (dataset, k) keys for resumable batch runs."""
+def completed_runs(
+    csv_path: Path, rerun_statuses: set[str] | None = None
+) -> set[tuple[str, int]]:
+    """Return (dataset, k) runs that should be skipped when resuming."""
+    rerun_statuses = {status.upper() for status in (rerun_statuses or set())}
     if not csv_path.exists() or csv_path.stat().st_size == 0:
         return set()
     with csv_path.open("r", encoding="utf-8", newline="") as source:
@@ -848,13 +851,15 @@ def completed_runs(csv_path: Path) -> set[tuple[str, int]]:
             reader.fieldnames
         ):
             raise ValueError(f"CSV {csv_path} thieu cot dataset/k/status")
-        completed: set[tuple[str, int]] = set()
+        latest_status: dict[tuple[str, int], str] = {}
         for row in reader:
             dataset = (row.get("dataset") or "").strip()
-            status = (row.get("status") or "").strip()
+            status = (row.get("status") or "").strip().upper()
             if dataset and status:
-                completed.add((dataset, int(row["k"])))
-        return completed
+                latest_status[(dataset, int(row["k"]))] = status
+        return {
+            run for run, status in latest_status.items() if status not in rerun_statuses
+        }
 
 
 def append_csv_result(csv_path: Path, result: Mapping[str, object]) -> None:
@@ -866,6 +871,50 @@ def append_csv_result(csv_path: Path, result: Mapping[str, object]) -> None:
             writer.writeheader()
         writer.writerow({field: result.get(field, "") for field in RESULT_FIELDS})
         output.flush()
+
+
+def upsert_csv_result(csv_path: Path, result: Mapping[str, object]) -> None:
+    """Atomically replace one (dataset, k) row, or append a new run."""
+    if not csv_path.exists() or csv_path.stat().st_size == 0:
+        append_csv_result(csv_path, result)
+        return
+
+    with csv_path.open("r", encoding="utf-8", newline="") as source:
+        reader = csv.DictReader(source)
+        if reader.fieldnames is None or not set(RESULT_FIELDS) <= set(reader.fieldnames):
+            raise ValueError(f"CSV {csv_path} khong dung schema ket qua")
+        rows = list(reader)
+
+    dataset = str(result.get("dataset") or "").strip()
+    run_k = int(result["k"])
+    replacement = {field: result.get(field, "") for field in RESULT_FIELDS}
+    new_rows: list[Mapping[str, object]] = []
+    replaced = False
+    for row in rows:
+        same_run = (
+            (row.get("dataset") or "").strip() == dataset
+            and int(row["k"]) == run_k
+        )
+        if same_run:
+            if not replaced:
+                new_rows.append(replacement)
+                replaced = True
+        else:
+            new_rows.append(row)
+    if not replaced:
+        new_rows.append(replacement)
+
+    temporary = csv_path.with_name(csv_path.name + ".tmp")
+    with temporary.open("w", encoding="utf-8", newline="") as output:
+        writer = csv.DictWriter(output, fieldnames=RESULT_FIELDS)
+        writer.writeheader()
+        writer.writerows(
+            {field: row.get(field, "") for field in RESULT_FIELDS}
+            for row in new_rows
+        )
+        output.flush()
+        os.fsync(output.fileno())
+    temporary.replace(csv_path)
 
 
 def _resolve_cplex_path(path: str | None) -> str:
@@ -903,6 +952,16 @@ def main() -> None:
         "--solution-dir",
         type=Path,
         default=script_path.parent / "k2-solutions",
+    )
+    parser.add_argument(
+        "--rerun-status",
+        action="append",
+        default=[],
+        metavar="STATUS",
+        help=(
+            "chi chay lai va thay the cac dong co status nay trong CSV; "
+            "co the lap option, vi du --rerun-status INVALID"
+        ),
     )
     parser.add_argument("--worker", type=Path, help=argparse.SUPPRESS)
     parser.add_argument("--result-file", type=Path, help=argparse.SUPPRESS)
@@ -976,16 +1035,37 @@ def main() -> None:
 
     ram_limit_bytes = int(args.ram_limit_gb * 1024**3)
     try:
-        already_completed = completed_runs(args.output_csv)
+        rerun_statuses = {
+            status.strip().upper()
+            for status in args.rerun_status
+            if status.strip()
+        }
+        recorded_runs = completed_runs(args.output_csv)
+        already_completed = completed_runs(args.output_csv, rerun_statuses)
     except (OSError, ValueError, csv.Error) as exc:
         parser.error(f"Khong the doc CSV ket qua cu: {exc}")
-    pending_graphs = [
-        path for path in graph_paths if (path.name, args.k) not in already_completed
-    ]
+    if rerun_statuses:
+        pending_graphs = [
+            path
+            for path in graph_paths
+            if (path.name, args.k) in recorded_runs
+            and (path.name, args.k) not in already_completed
+        ]
+    else:
+        pending_graphs = [
+            path for path in graph_paths if (path.name, args.k) not in already_completed
+        ]
+    selection_summary = (
+        f"chon chay lai={len(pending_graphs)} case co status "
+        f"{','.join(sorted(rerun_statuses))}"
+        if rerun_statuses
+        else (
+            f"da co ket qua={len(graph_paths) - len(pending_graphs)}, "
+            f"con lai={len(pending_graphs)}"
+        )
+    )
     print(
-        f"Tim thay {len(graph_paths)} graph; "
-        f"da co ket qua={len(graph_paths) - len(pending_graphs)}, "
-        f"con lai={len(pending_graphs)}. K={args.k}, "
+        f"Tim thay {len(graph_paths)} graph; {selection_summary}. K={args.k}, "
         f"timeout={args.timeout:g}s, RAM={args.ram_limit_gb:g} GiB/graph. "
         "Mo hinh explicit Equation (2)-(5), solver=CPLEX_CMD.",
         flush=True,
@@ -1005,7 +1085,7 @@ def main() -> None:
             args.k,
             args.threads,
         )
-        append_csv_result(args.output_csv, result)
+        upsert_csv_result(args.output_csv, result)
         print(
             f"[{index:02d}/{len(pending_graphs):02d}] {graph_path.name}: "
             f"STATUS={result['status']} | time={result['elapsed_seconds']}s | "
