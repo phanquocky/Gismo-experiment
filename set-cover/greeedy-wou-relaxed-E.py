@@ -4,7 +4,8 @@
 Thuc nghiem co dinh ``E = 2`` va chi dung cong thuc ``new_gain`` trong
 ``greedy_wou_relaxed_E.md``. Moi graph chay trong mot worker rieng voi timeout
 8 gio va gioi han RAM 64 GiB. Ket qua duoc ghi vao CSV va co the tiep tuc
-(resume) theo cap ``dataset, E``.
+(resume) theo cap ``dataset, E``. Khi chay batch mac dinh, ba graph lon nhat
+theo so dinh se duoc bo qua.
 """
 
 from __future__ import annotations
@@ -24,10 +25,11 @@ from pathlib import Path
 
 
 Graph = dict[int, set[int]]
-E_VALUES = (4,5,10)
+E_VALUES = (2, 3, 4, 10)
 DEFAULT_TIMEOUT_SECONDS = 8 * 60 * 60
 DEFAULT_RAM_LIMIT_GB = 64.0
 SUPPORTED_SUFFIXES = {".txt", ".mtx", ".edges"}
+DEFAULT_LARGEST_GRAPHS_TO_SKIP = 3
 
 
 def _load_batch_support():
@@ -551,6 +553,7 @@ def main() -> None:
         parser.error("--ram-limit-gb phai lon hon 0")
 
     dataset_directory = project_directory / "standardized_dataset"
+    is_default_batch = not args.graphs
     graph_paths = args.graphs or [
         path
         for path in dataset_directory.iterdir()
@@ -568,6 +571,14 @@ def main() -> None:
         )
     except (OSError, ValueError) as exc:
         parser.error(f"Khong the sap xep graph theo so dinh: {exc}")
+
+    if is_default_batch:
+        skipped_graphs = graph_paths[-DEFAULT_LARGEST_GRAPHS_TO_SKIP:]
+        graph_paths = graph_paths[:-DEFAULT_LARGEST_GRAPHS_TO_SKIP]
+        print(
+            f"Bo qua {len(skipped_graphs)} graph lon nhat: "
+            + ", ".join(path.name for path in skipped_graphs)
+        )
 
     configurations = [(graph_path, args.E) for graph_path in graph_paths]
     try:
