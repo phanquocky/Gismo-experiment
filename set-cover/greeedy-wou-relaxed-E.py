@@ -1,11 +1,12 @@
 #!/usr/bin/env python3
 """Chay Greedy-WOU relaxed voi new_gain tren cac graph da chuan hoa.
 
-Thuc nghiem co dinh ``E = 2`` va chi dung cong thuc ``new_gain`` trong
-``greedy_wou_relaxed_E.md``. Moi graph chay trong mot worker rieng voi timeout
-8 gio va gioi han RAM 64 GiB. Ket qua duoc ghi vao CSV va co the tiep tuc
-(resume) theo cap ``dataset, E``. Khi chay batch mac dinh, ba graph lon nhat
-theo so dinh se duoc bo qua.
+Mac dinh, moi graph duoc chay voi tat ca gia tri trong ``E_VALUES`` va chi
+dung cong thuc ``new_gain`` trong ``greedy_wou_relaxed_E.md``. Moi cau hinh
+``(graph, E)`` chay trong mot worker rieng voi timeout 8 gio va gioi han RAM
+64 GiB. Ket qua duoc ghi vao CSV va co the tiep tuc (resume) theo cap
+``dataset, E``. Khi chay batch mac dinh, ba graph lon nhat theo so dinh se
+duoc bo qua.
 """
 
 from __future__ import annotations
@@ -512,7 +513,18 @@ def main() -> None:
     )
     parser.add_argument("--timeout", type=float, default=DEFAULT_TIMEOUT_SECONDS)
     parser.add_argument("--ram-limit-gb", type=float, default=DEFAULT_RAM_LIMIT_GB)
-    parser.add_argument("--E", type=int, choices=E_VALUES, default=E_VALUES[0])
+    parser.add_argument(
+        "--E",
+        dest="e_values",
+        type=int,
+        choices=E_VALUES,
+        action="append",
+        help=(
+            "gia tri E can chay (lap lai tuy chon de chon nhieu E); "
+            "mac dinh chay tat ca: "
+            + ", ".join(map(str, E_VALUES))
+        ),
+    )
     parser.add_argument(
         "--output-csv",
         type=Path,
@@ -536,13 +548,15 @@ def main() -> None:
     if args.worker is not None:
         if args.result_file is None or args.worker_ram_bytes is None:
             parser.error("--worker requires --result-file and --worker-ram-bytes")
+        if args.e_values is None or len(args.e_values) != 1:
+            parser.error("worker requires exactly one value for --E")
         batch_support._set_ram_limit(args.worker_ram_bytes)
         raise SystemExit(
             run_worker(
                 args.worker,
                 args.result_file,
                 args.solution_dir,
-                args.E,
+                args.e_values[0],
                 batch_support,
             )
         )
@@ -551,6 +565,8 @@ def main() -> None:
         parser.error("--timeout phai lon hon 0")
     if args.ram_limit_gb <= 0:
         parser.error("--ram-limit-gb phai lon hon 0")
+
+    selected_e_values = args.e_values or list(E_VALUES)
 
     dataset_directory = project_directory / "standardized_dataset"
     is_default_batch = not args.graphs
@@ -580,7 +596,11 @@ def main() -> None:
             + ", ".join(path.name for path in skipped_graphs)
         )
 
-    configurations = [(graph_path, args.E) for graph_path in graph_paths]
+    configurations = [
+        (graph_path, E)
+        for graph_path in graph_paths
+        for E in selected_e_values
+    ]
     try:
         already_completed = completed_runs(args.output_csv)
     except (OSError, ValueError, csv.Error) as exc:
@@ -594,7 +614,8 @@ def main() -> None:
     print(
         f"Tim thay {len(graph_paths)} graph, {len(configurations)} cau hinh; "
         f"da co ket qua={len(configurations) - len(pending)}, con lai={len(pending)}. "
-        f"E={args.E}; mode=new_gain; timeout={args.timeout:g}s; "
+        f"E={','.join(map(str, selected_e_values))}; mode=new_gain; "
+        f"timeout={args.timeout:g}s; "
         f"RAM limit={args.ram_limit_gb:g} GiB/cau hinh. "
         "Thu tu graph: so dinh tang dan."
     )
